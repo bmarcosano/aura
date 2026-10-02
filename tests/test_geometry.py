@@ -9,7 +9,7 @@ def test_calculate_right_angle():
     a = np.array([0.0, 1.0])
     b = np.array([0.0, 0.0])  # Vertex
     c = np.array([1.0, 0.0])
-    
+
     angle = calculate_angle(a, b, c)
     assert np.isclose(angle, 90.0, atol=1e-5)
 
@@ -19,7 +19,7 @@ def test_calculate_straight_angle():
     a = np.array([-1.0, 0.0])
     b = np.array([0.0, 0.0])  # Vertex
     c = np.array([1.0, 0.0])
-    
+
     angle = calculate_angle(a, b, c)
     assert np.isclose(angle, 180.0, atol=1e-5)
 
@@ -29,6 +29,6 @@ def test_calculate_zero_angle():
     a = np.array([1.0, 0.0])
     b = np.array([0.0, 0.0])  # Vertex
     c = np.array([1.0, 0.0])
-    
+
     angle = calculate_angle(a, b, c)
     assert np.isclose(angle, 0.0, atol=1e-5)

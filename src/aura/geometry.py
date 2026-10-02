@@ -18,7 +18,7 @@ def calculate_angle(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> float:
 
     # Product of vectors magnitudes
     norm_product = np.linalg.norm(ba) * np.linalg.norm(bc)
-    
+
     # Prevent division by zero safely without skewing normal values
     if norm_product < 1e-6:
         return 0.0
