@@ -82,12 +82,12 @@ class PostureAnalyzer:
         left_shoulder = landmarks[11][:2]
         right_shoulder = landmarks[12][:2]
         shoulder_mid_x = (left_shoulder[0] + right_shoulder[0]) / 2.0
-        shoulder_mid_y = (left_shoulder[1] + right_shoulder[1]) / 2.0
+        # shoulder_mid_y = (left_shoulder[1] + right_shoulder[1]) / 2.0
 
         # Head reference (Nose = 0 or midpoint of ears 7 & 8)
         # Using Nose (0) as primary head landmark point
         head_x = landmarks[0][0]
-        head_y = landmarks[0][1]
+        # head_y = landmarks[0][1]
 
         # Forward offset in pixels (horizontal deviation from shoulder midpoint)
         # Positive forward/backward offset magnitude

@@ -1,7 +1,7 @@
 """test_detector.py: Unit tests for PoseDetector class."""
 
 import numpy as np
-import pytest
+
 from aura.detector import PoseDetector
 
 
