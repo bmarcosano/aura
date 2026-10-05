@@ -56,40 +56,38 @@ def main() -> None:
 
         # --- PHASE 1: AUTO-CALIBRATION ---
         if multi_detector is None:
-            # Update calibrator with the current frame
-            # The calibrator will draw feedback lines directly on this frame
             split_ratio = calibrator.update(frame)
             
             if split_ratio is not None:
-                # Calibration complete! Initialize the MultiSkeletonDetector with the calculated ratio
                 print(f"\n✅ Calibration complete! Optimal split ratio locked at: {split_ratio:.3f}")
                 multi_detector = MultiSkeletonDetector(split_ratio=split_ratio)
-                
-                # Close the temporary calibration window
                 cv2.destroyWindow("AURA - Calibration")
             else:
-                # Still calibrating, show the full frame with green feedback lines
                 cv2.imshow("AURA - Calibration", frame)
                 
         # --- PHASE 2: DETECTION AND ROI CROPPING ---
         else:
-            # 1. Crop the frame into Front View and Mirror View ROIs using the calibrated ratio
             front_roi, mirror_roi = multi_detector._crop_rois(frame)
 
-            if front_roi.size == 0 or mirror_roi.size == 0 or front_roi.shape[0] == 0 or mirror_roi.shape[0] == 0:
-                continue
+            # Execute pose detection only if both ROIs are valid and non-empty
+            if front_roi.size > 0 and mirror_roi.size > 0 and front_roi.shape[0] > 0 and mirror_roi.shape[1] > 0:
+                _ = front_pose_detector.detect(front_roi, draw=True)
+                _ = mirror_pose_detector.detect(mirror_roi, draw=True)
 
-            # 2. Run MediaPipe pose detection (modifies ROIs in-place)
-            _ = front_pose_detector.detect(front_roi, draw=True)
-            _ = mirror_pose_detector.detect(mirror_roi, draw=True)
+                cv2.imshow("AURA - Front View", front_roi)
+                cv2.imshow("AURA - Mirror View (Flipped)", mirror_roi)
+            else:
+                # Print a warning if the ROIs are invalid, but continue processing subsequent frames
+                print("⚠️ Frame saltato: dimensioni della ROI non valide.")
 
-            # 3. Display the separated and annotated views
-            cv2.imshow("AURA - Front View", front_roi)
-            cv2.imshow("AURA - Mirror View (Flipped)", mirror_roi)
-
-        # Wait according to calculated delay, exit on 'q'
+        # --- KEYBOARD LISTENER ---
+        # Key listener for quitting the application. Note: click on one of the video windows before pressing 'q'.
         if cv2.waitKey(delay) & 0xFF == ord("q"):
+            print("Chiusura manuale richiesta dall'utente.")
             break
+
+    cap.release()
+    cv2.destroyAllWindows()
 
     cap.release()
     cv2.destroyAllWindows()
