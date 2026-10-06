@@ -91,8 +91,8 @@ AURA_project/
 
 **1. Clone the repository:**
 ```bash
-git clone [https://github.com/bmarcosano/AURA_project.git](https://github.com/bmarcosano/AURA_project.git)
-cd AURA_project
+git clone https://github.com/bmarcosano/aura
+cd aura
 ```
 
 **2. Set up a virtual environment (Recommended):**
