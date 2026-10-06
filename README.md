@@ -30,16 +30,24 @@ To solve the multi-view occlusion problem without invasive multi-camera setups o
 ## 6. Modular Software Structure
 The codebase follows a clean separation of concerns:
 ```text
-aura/
+AURA_project
 ├── README.md
 ├── pyproject.toml
-├── src/
-│   └── aura/
-│       ├── __init__.py
-│       ├── detector.py      # Camera stream & ROI optical management
-│       ├── geometry.py      # Vector math & angular computations
-│       ├── dtw_engine.py    # Temporal alignment against Gold Standard
-│       ├── xai_feedback.py  # Threshold rules & visual/audio feedback triggers
-│       └── ui_kiosk.py      # State machine & mirror interface
-└── tests/
-    └── assets/              # Mock video files & reference datasets
+├── scripts
+│   ├── main.py
+│   ├── run_multiskeleton_test.py
+│   └── run_webcam.py
+├── src
+│   └── aura
+│       ├── analyzer.py
+│       ├── calibrator.py
+│       ├── detector.py
+│       ├── fusion.py
+│       ├── geometry.py
+│       └── multi_detector.py
+└── tests
+    ├── assets
+    ├── test_analyzer.py
+    ├── test_detector.py
+    ├── test_geometry.py
+    └── test_multi_detector.py
