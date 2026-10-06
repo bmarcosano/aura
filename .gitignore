@@ -45,3 +45,6 @@ venv.bak/
 .coverage
 htmlcov/
 input_videos/
+
+# Docs
+docs/
