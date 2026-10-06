@@ -135,6 +135,11 @@ pre-commit install
   python scripts/main.py --source <video_relative_path>
   ```
 
+- **Quit the application:**
+    ```bash
+    q
+    ```
+
 ### Quality Assurance (Testing & Linting)
 - **Run the Unit Test Suite (Pytest):**
   ```bash
