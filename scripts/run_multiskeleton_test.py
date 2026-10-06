@@ -78,17 +78,15 @@ def main() -> None:
                 cv2.imshow("AURA - Mirror View (Flipped)", mirror_roi)
             else:
                 # Print a warning if the ROIs are invalid, but continue processing subsequent frames
-                print("⚠️ Frame saltato: dimensioni della ROI non valide.")
+                print("⚠️ Warning: Invalid or empty ROIs detected. Skipping pose detection for this frame.")
 
         # --- KEYBOARD LISTENER ---
-        # Key listener for quitting the application. Note: click on one of the video windows before pressing 'q'.
-        if cv2.waitKey(delay) & 0xFF == ord("q"):
-            print("Chiusura manuale richiesta dall'utente.")
+        # Key listener for quitting the application. Note: focus on one of the video windows before pressing 'q'.
+        if cv2.waitKey(delay) & 0xFF == ord('q'):
+            print("❌ Exit command received. Terminating the test.")
             break
 
-    cap.release()
-    cv2.destroyAllWindows()
-
+    # Clean up resources properly
     cap.release()
     cv2.destroyAllWindows()
 
