@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """detector.py: MediaPipe Pose estimation and webcam stream management."""
 
 import cv2

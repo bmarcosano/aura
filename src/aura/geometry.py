@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """geometry.py: Core biomechanical calculations using NumPy vectors."""
 
 import numpy as np

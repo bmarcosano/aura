@@ -1,6 +1,7 @@
 """test_geometry.py: Unit tests for biomechanical angle calculations."""
 
 import numpy as np
+
 from aura.geometry import calculate_angle
 
 
