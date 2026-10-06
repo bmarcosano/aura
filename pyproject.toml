@@ -25,3 +25,7 @@ addopts = "-ra -q"
 testpaths = [
     "tests",
 ]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore:.*inference_feedback_manager.*:Warning",
+]

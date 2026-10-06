@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import argparse
 import sys
+
 import cv2
 
+from aura.calibrator import AutoSplitCalibrator
 from aura.detector import PoseDetector
 from aura.multi_detector import MultiSkeletonDetector
-from aura.calibrator import AutoSplitCalibrator
 
 
 def main() -> None:
@@ -39,17 +40,21 @@ def main() -> None:
     calibrator = AutoSplitCalibrator()
     front_pose_detector = PoseDetector()
     mirror_pose_detector = PoseDetector()
-    
+
     # This will remain None until calibration is successfully completed
     multi_detector: MultiSkeletonDetector | None = None
 
-    print(f"🚀 Starting test using source: {source} (FPS: {fps if fps > 0 else 'N/A'}).")
-    print("⏳ CALIBRATION PHASE: Analysing motion to find the optimal mirror split line...")
+    print(
+        f"🚀 Starting test using source: {source} (FPS: {fps if fps > 0 else 'N/A'})."
+    )
+    print(
+        "⏳ CALIBRATION PHASE: Analysing motion to find the optimal mirror split line..."
+    )
     print("Press 'q' at any time to exit.")
 
     while cap.isOpened():
         success, frame = cap.read()
-        
+
         if not success or frame is None or frame.size == 0:
             print("End of video stream or empty frame received.")
             break
@@ -57,20 +62,27 @@ def main() -> None:
         # --- PHASE 1: AUTO-CALIBRATION ---
         if multi_detector is None:
             split_ratio = calibrator.update(frame)
-            
+
             if split_ratio is not None:
-                print(f"\n✅ Calibration complete! Optimal split ratio locked at: {split_ratio:.3f}")
+                print(
+                    f"\n✅ Calibration complete! Optimal split ratio locked at: {split_ratio:.3f}"
+                )
                 multi_detector = MultiSkeletonDetector(split_ratio=split_ratio)
                 cv2.destroyWindow("AURA - Calibration")
             else:
                 cv2.imshow("AURA - Calibration", frame)
-                
+
         # --- PHASE 2: DETECTION AND ROI CROPPING ---
         else:
             front_roi, mirror_roi = multi_detector._crop_rois(frame)
 
             # Execute pose detection only if both ROIs are valid and non-empty
-            if front_roi.size > 0 and mirror_roi.size > 0 and front_roi.shape[0] > 0 and mirror_roi.shape[1] > 0:
+            if (
+                front_roi.size > 0
+                and mirror_roi.size > 0
+                and front_roi.shape[0] > 0
+                and mirror_roi.shape[1] > 0
+            ):
                 _ = front_pose_detector.detect(front_roi, draw=True)
                 _ = mirror_pose_detector.detect(mirror_roi, draw=True)
 
@@ -78,11 +90,13 @@ def main() -> None:
                 cv2.imshow("AURA - Mirror View (Flipped)", mirror_roi)
             else:
                 # Print a warning if the ROIs are invalid, but continue processing subsequent frames
-                print("⚠️ Warning: Invalid or empty ROIs detected. Skipping pose detection for this frame.")
+                print(
+                    "⚠️ Warning: Invalid or empty ROIs detected. Skipping pose detection for this frame."
+                )
 
         # --- KEYBOARD LISTENER ---
         # Key listener for quitting the application. Note: focus on one of the video windows before pressing 'q'.
-        if cv2.waitKey(delay) & 0xFF == ord('q'):
+        if cv2.waitKey(delay) & 0xFF == ord("q"):
             print("❌ Exit command received. Terminating the test.")
             break
 
