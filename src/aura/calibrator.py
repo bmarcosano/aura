@@ -2,8 +2,8 @@
 Module for automatic spatial calibration using motion detection (The Calibrator).
 
 Once the Sync Analyzer (in main.py) confirms the presence of a mirror via kinematics,
-this module takes over to pinpoint the exact geometric boundary (split_ratio) between 
-the real user and the reflection. It uses a lightweight background subtractor (MOG2) 
+this module takes over to pinpoint the exact geometric boundary (split_ratio) between
+the real user and the reflection. It uses a lightweight background subtractor (MOG2)
 to track the center of mass of the two moving bodies and calculates their exact midpoint.
 """
 
@@ -16,7 +16,7 @@ import numpy as np
 class AutoSplitCalibrator:
     """
     Calibrates the split ratio by analyzing synchronized movements in the frame.
-    Instead of heavy neural networks, it uses pixel-level motion detection to find 
+    Instead of heavy neural networks, it uses pixel-level motion detection to find
     the two largest moving objects (user and mirror reflection) and splits the difference.
     """
 
@@ -25,14 +25,14 @@ class AutoSplitCalibrator:
         # learningRate=-1 lets the algorithm automatically decide the background update speed.
         # detectShadows=False improves performance and prevents shadows from distorting the center of mass.
         self.bg_subtractor = cv2.createBackgroundSubtractorMOG2(detectShadows=False)
-        
+
         # Stores valid split ratios calculated across multiple frames to average out anomalies.
         self.split_ratios: list[float] = []
-        
+
         # How many successful readings we need to consider the calibration complete
         self.required_frames = required_frames
-        
-        # Fallback mechanism: if the user stops moving or lighting is bad, force a 
+
+        # Fallback mechanism: if the user stops moving or lighting is bad, force a
         # split after this many frames to prevent the system from hanging indefinitely.
         self.timeout_frames = timeout_frames
         self.frame_count = 0
@@ -68,11 +68,11 @@ class AutoSplitCalibrator:
         # --- 4. NOISE REDUCTION (MORPHOLOGICAL OPERATIONS) ---
         # Define a 3x3 circular kernel for morphological operations
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        
+
         # MORPH_OPEN: Erases tiny white dots (salt-and-pepper noise/camera artifacts)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-        
-        # MORPH_DILATE: Expands the remaining white areas to merge fragmented body parts 
+
+        # MORPH_DILATE: Expands the remaining white areas to merge fragmented body parts
         # into a single solid blob for each person/reflection.
         mask = cv2.morphologyEx(mask, cv2.MORPH_DILATE, kernel, iterations=3)
 
@@ -107,7 +107,7 @@ class AutoSplitCalibrator:
             if len(centers_x) == 2:
                 # The optical split line is exactly halfway between the real user and the reflection
                 midpoint_x = sum(centers_x) / 2.0
-                
+
                 # Convert the absolute pixel X-coordinate into a normalized ratio (0.0 to 1.0)
                 ratio = midpoint_x / w
                 self.split_ratios.append(ratio)
