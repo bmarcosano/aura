@@ -26,7 +26,7 @@ Unlike heavy, proprietary black-box systems, AURA is engineered following an **e
 ## 3. Flexible Optical Setup (Single-Camera vs. 45° Mirror Mode)
 To solve the multi-view occlusion problem without invasive multi-camera setups or heavy 3D mesh recovery networks, AURA supports a dual optical configuration:
 - **Standard Mode:** Direct front-facing webcam view for baseline exercises.
-- **Advanced "Magic Mirror" Mode (45° Side Mirror Setup):** Pairs a single front-facing webcam with a side mirror. A single video frame simultaneously captures both the direct (frontal) and reflected (lateral) views, leveraging the physics of light to achieve complete **360° biomechanical analysis** with minimal CPU overhead via dynamic Region-of-Interest (ROI) cropping.
+- **Advanced "Mirror Mode" (45° Side Mirror Setup):** Pairs a single front-facing webcam with a side mirror. A single video frame simultaneously captures both the direct (frontal) and reflected (lateral) views, leveraging the physics of light to achieve complete **360° biomechanical analysis** with minimal CPU overhead via dynamic Region-of-Interest (ROI) cropping.
 
 ## 4. User Experience (HCI & UX)
 - **The Clean Mirror:** The display functions primarily as a clean mirror, allowing users to focus entirely on their own physical execution without distracting moving overlays.

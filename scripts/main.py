@@ -206,6 +206,7 @@ def main() -> None:
         # ==========================================
         # STATE 1: SINGLE MODE
         # Default full-screen execution state.
+        # Default full-screen execution state.
         # ==========================================
         if current_state == STATE_SINGLE:
             display_frame = frame.copy()
@@ -230,6 +231,7 @@ def main() -> None:
             if frame_count % 10 == 0:
                 mid = w // 2
 
+                # Split frame strictly in half to search for dual subjects
                 # Split frame strictly in half to search for dual subjects
                 left_half = cv2.cvtColor(frame[:, :mid], cv2.COLOR_BGR2RGB)
                 right_half = cv2.cvtColor(frame[:, mid:], cv2.COLOR_BGR2RGB)
@@ -308,6 +310,8 @@ def main() -> None:
 
                                 # Threshold Check: Human imitation is flawed. Only a true physical 
                                 # mirror reflection can maintain > 95% perfect statistical synchronization.
+                                # Threshold Check: Human imitation is flawed. Only a true physical 
+                                # mirror reflection can maintain > 95% perfect statistical synchronization.
                                 if pearson_r > 0.95:
                                     print(
                                         f"👀 Synchronized movement confirmed! Mirror detected (r={pearson_r:.2f}). Transitioning..."
@@ -329,6 +333,7 @@ def main() -> None:
         # ==========================================
         # STATE 2: MIRROR MODE
         # Split-screen execution analyzing sagittal and frontal planes.
+        # Split-screen execution analyzing sagittal and frontal planes.
         # ==========================================
         elif current_state == STATE_MIRROR:
             # 1. Calibration Phase: Pinpoint the exact optical split line
@@ -346,14 +351,18 @@ def main() -> None:
             # 2. Continuous Dual-Tracking Phase
             else:
                 # Crop the physical frame into two separate matrices
+                # Crop the physical frame into two separate matrices
                 front_roi, mirror_roi = multi_detector._crop_rois(frame)
 
                 if front_roi.size > 0 and mirror_roi.size > 0:
+                    # Run independent MediaPipe inference simultaneously on both perspectives
                     # Run independent MediaPipe inference simultaneously on both perspectives
                     front_pose_detector.detect(front_roi, draw=True)
                     mirror_pose_detector.detect(mirror_roi, draw=True)
 
                     # --- SENSOR FUSION STEP ---
+                    # Combine frontal symmetry parameters (40% weight) with 
+                    # mirror profile safety parameters (60% weight, with safety overrides)
                     # Combine frontal symmetry parameters (40% weight) with 
                     # mirror profile safety parameters (60% weight, with safety overrides)
                     fusion_result = fusion_engine.evaluate_posture(
@@ -366,6 +375,8 @@ def main() -> None:
                     )
                     
                     # Render independent metric HUDs on both window perspectives
+                    
+                    # Render independent metric HUDs on both window perspectives
                     draw_postural_hud(
                         front_roi, getattr(front_pose_detector, "results", None)
                     )
@@ -373,6 +384,7 @@ def main() -> None:
                         mirror_roi, getattr(mirror_pose_detector, "results", None)
                     )
 
+                    # Superimpose the unified global fusion verdict on the primary view
                     # Superimpose the unified global fusion verdict on the primary view
                     status_text = f"FUSION: {fusion_result['state']}"
                     cv2.putText(
@@ -394,6 +406,7 @@ def main() -> None:
             print("❌ Exit command received. Terminating...")
             break
 
+    # Graceful teardown
     # Graceful teardown
     cap.release()
     cv2.destroyAllWindows()
