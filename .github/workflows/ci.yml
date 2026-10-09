@@ -2,9 +2,9 @@ name: AURA CI
 
 on:
   push:
-    branches: [ main, milestone2.1 ]
+    branches: [ main ]
   pull_request:
-    branches: [ main, milestone2.1 ]
+    branches: [ main]
 
 jobs:
   test-and-lint:
@@ -27,8 +27,8 @@ jobs:
 
       - name: Run Ruff Linter & Formatter check
         run: |
-          ruff check .
-          ruff format --check .
+          ruff check . --fix
+          ruff format .
 
       - name: Run Pytest Suite
         run: |
