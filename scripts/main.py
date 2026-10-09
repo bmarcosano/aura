@@ -1,6 +1,6 @@
 """
 AURA - Main Entry Point (v2.1.0)
-Dynamic biomechanical analysis system transitioning autonomously from Single Mode 
+Dynamic biomechanical analysis system transitioning autonomously from Single Mode
 to Mirror Mode using a lightweight "Silent Split" correlation algorithm.
 Features real-time Postural HUD feedback and Multi-View Sensor Fusion.
 """
@@ -36,7 +36,7 @@ STATE_MIRROR = "MIRROR_MODE"
 def draw_postural_hud(frame, pose_results) -> None:
     """
     Draws a semi-transparent Head-Up Display (HUD) in the top-left corner.
-    Extracts raw landmarks from the pose results to compute real-time 
+    Extracts raw landmarks from the pose results to compute real-time
     biomechanical metrics (shoulder tilt, hip tilt, and head alignment).
     """
     _h, _w, _ = frame.shape
@@ -54,7 +54,7 @@ def draw_postural_hud(frame, pose_results) -> None:
     ):
         try:
             lm_list = pose_results.pose_landmarks.landmark
-            
+
             # Map specific anatomical landmarks
             l_shoulder = lm_list[11]
             r_shoulder = lm_list[12]
@@ -89,7 +89,7 @@ def draw_postural_hud(frame, pose_results) -> None:
             hip_status, hip_color = get_status(hip_tilt, 0.03, 0.07)
             head_status, head_color = get_status(head_offset, 0.04, 0.08)
         except (AttributeError, IndexError):
-            pass # Ignore frames with incomplete landmark mapping
+            pass  # Ignore frames with incomplete landmark mapping
 
     # Draw semi-transparent background box for readability
     overlay = frame.copy()
@@ -149,7 +149,10 @@ def main() -> None:
     # --- CLI ARGUMENT PARSER ---
     parser = argparse.ArgumentParser(description="AURA - Autonomous Pose Tracking")
     parser.add_argument(
-        "--source", type=str, default="0", help="Video source path or 0 for local webcam"
+        "--source",
+        type=str,
+        default="0",
+        help="Video source path or 0 for local webcam",
     )
     args = parser.parse_args()
 
@@ -167,7 +170,7 @@ def main() -> None:
     # --- COMPONENT INITIALIZATION ---
     # Standard detector for single-view fallback
     single_detector = PoseDetector()
-    
+
     # Dual-detectors dedicated for the mirror setup
     front_pose_detector = PoseDetector()
     mirror_pose_detector = PoseDetector()
@@ -241,7 +244,6 @@ def main() -> None:
 
                 # Condition 1: Two skeletons must be present in the frame
                 if res_left.pose_landmarks and res_right.pose_landmarks:
-                    
                     # --- GAP TEST: Verify spatial separation ---
                     # Prevents a single centered person from being registered as two halves.
                     # Translates normalized landmark coordinates to absolute pixel X coordinates.
@@ -261,7 +263,7 @@ def main() -> None:
                         max_x_left = max(left_x_coords)
                         min_x_right = min(right_x_coords)
                         body_gap = min_x_right - max_x_left
-                        
+
                         # Require at least 4% of screen width as a physical separation barrier
                         min_required_gap = w * 0.04
 
@@ -308,9 +310,9 @@ def main() -> None:
                                     else 0.0
                                 )
 
-                                # Threshold Check: Human imitation is flawed. Only a true physical 
+                                # Threshold Check: Human imitation is flawed. Only a true physical
                                 # mirror reflection can maintain > 95% perfect statistical synchronization.
-                                # Threshold Check: Human imitation is flawed. Only a true physical 
+                                # Threshold Check: Human imitation is flawed. Only a true physical
                                 # mirror reflection can maintain > 95% perfect statistical synchronization.
                                 if pearson_r > 0.95:
                                     print(
@@ -347,7 +349,7 @@ def main() -> None:
                     cv2.destroyWindow("AURA - Calibration")
                 else:
                     cv2.imshow("AURA - Calibration", frame)
-            
+
             # 2. Continuous Dual-Tracking Phase
             else:
                 # Crop the physical frame into two separate matrices
@@ -361,9 +363,9 @@ def main() -> None:
                     mirror_pose_detector.detect(mirror_roi, draw=True)
 
                     # --- SENSOR FUSION STEP ---
-                    # Combine frontal symmetry parameters (40% weight) with 
+                    # Combine frontal symmetry parameters (40% weight) with
                     # mirror profile safety parameters (60% weight, with safety overrides)
-                    # Combine frontal symmetry parameters (40% weight) with 
+                    # Combine frontal symmetry parameters (40% weight) with
                     # mirror profile safety parameters (60% weight, with safety overrides)
                     fusion_result = fusion_engine.evaluate_posture(
                         getattr(front_pose_detector, "results", None),
@@ -373,9 +375,9 @@ def main() -> None:
                     print(
                         f"🔥 [FUSION] Global: {fusion_result['state']} | {fusion_result['front_msg']} || {fusion_result['mirror_msg']}"
                     )
-                    
+
                     # Render independent metric HUDs on both window perspectives
-                    
+
                     # Render independent metric HUDs on both window perspectives
                     draw_postural_hud(
                         front_roi, getattr(front_pose_detector, "results", None)
