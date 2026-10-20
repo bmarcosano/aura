@@ -1,11 +1,15 @@
 """
-AURA - Multi-View Sensor Fusion Engine
-Combines front-view symmetry analysis and mirror-view profile biomechanics
-into a unified safety and form score.
+AURA - Multi-View Sensor Fusion Engine (v2.2.0 - Advanced Coaching Update)
+Combines front-view symmetry and knee alignment analysis with
+mirror-view profile biomechanics into a unified safety and form score.
 """
+
+from __future__ import annotations
 
 
 class AuraFusionEngine:
+    """Combines multi-view pose evaluations into a unified form and safety status."""
+
     def __init__(self):
         # Weighting factors for global decision making
         self.front_weight = 0.40  # Symmetry & Balance
@@ -13,7 +17,7 @@ class AuraFusionEngine:
 
     def evaluate_posture(self, front_results, mirror_results):
         """
-        Takes MediaPipe (or detector) results from both views and returns
+        Takes MediaPipe results from both views and returns
         a unified posture evaluation with status and specific messages.
         """
         front_status = self._analyze_front(front_results)
@@ -38,7 +42,7 @@ class AuraFusionEngine:
         }
 
     def _analyze_front(self, results):
-        """Analyzes front-view symmetry (Shoulders and Hips tilt)."""
+        """Analyzes front-view symmetry, shoulder/hip tilt, and knee alignment."""
         if (
             not results
             or not hasattr(results, "pose_landmarks")
@@ -51,10 +55,17 @@ class AuraFusionEngine:
             shoulder_tilt = abs(lm[11].y - lm[12].y)
             hip_tilt = abs(lm[23].y - lm[24].y)
 
+            # Advanced kinematic check: Knee lateral deviation (Valgus / Tracking check)
+            l_knee_drift = abs(lm[25].x - lm[23].x)
+            r_knee_drift = abs(lm[26].x - lm[24].x)
+
             if shoulder_tilt > 0.07 or hip_tilt > 0.07:
                 return {"score": 0, "msg": "Front: Severe Asymmetry"}
+            elif l_knee_drift > 0.12 or r_knee_drift > 0.12:
+                return {"score": 1, "msg": "Front: Check Knee Alignment"}
             elif shoulder_tilt > 0.03 or hip_tilt > 0.03:
                 return {"score": 1, "msg": "Front: Mild Tilt"}
+
             return {"score": 2, "msg": "Front: Balanced"}
         except (AttributeError, IndexError):
             return {"score": 2, "msg": "Front: Tracking..."}
@@ -70,11 +81,7 @@ class AuraFusionEngine:
 
         try:
             lm = results.pose_landmarks.landmark
-            # Profile analysis approximation using shoulder, hip and knee alignment
-            # (Assuming mirror captures side profile or angled reflection)
-            torso_lean = abs(
-                lm[11].x - lm[23].x
-            )  # Horizontal offset between shoulder and hip
+            torso_lean = abs(lm[11].x - lm[23].x)
 
             if torso_lean > 0.15:
                 return {"score": 0, "msg": "Mirror: Torso Lean Risk!"}

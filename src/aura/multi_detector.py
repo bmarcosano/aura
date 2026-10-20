@@ -1,3 +1,5 @@
+"""multi_detector.py: Manages dual-view frame splitting and parallel pose detection."""
+
 from __future__ import annotations
 
 import cv2
@@ -7,6 +9,8 @@ from aura.detector import PoseDetector
 
 
 class MultiSkeletonDetector:
+    """Splits a dual-view frame into ROIs and processes them via independent detectors."""
+
     def __init__(self, split_ratio: float = 0.5):
         """
         Initializes the MultiSkeletonDetector.
@@ -36,14 +40,11 @@ class MultiSkeletonDetector:
         """
         front_roi, mirror_roi = self._crop_rois(frame)
 
-        # Apply horizontal flip to the mirror ROI so MediaPipe analyzes it as facing forward
+        # Apply horizontal flip to the mirror ROI so MediaPipe analyzes it properly
         flipped_mirror_roi = cv2.flip(mirror_roi, 1)
 
-        # Run detection (assuming PoseDetector returns processed frame and landmarks)
-        # Note: We will integrate actual PoseDetector calls here
-        front_landmarks = self.front_detector.get_landmark_array(
-            front_roi
-        )  # or equivalent method
-        mirror_landmarks = self.mirror_detector.get_landmark_array(flipped_mirror_roi)
+        # Process both ROIs using PoseDetector (which handles detection and landmark extraction)
+        front_landmarks = self.front_detector.detect(front_roi, draw=True)
+        mirror_landmarks = self.mirror_detector.detect(flipped_mirror_roi, draw=True)
 
         return {"front": front_landmarks, "mirror": mirror_landmarks}

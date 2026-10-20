@@ -45,3 +45,5 @@ venv.bak/
 .coverage
 htmlcov/
 input_videos/
+
+golden_executions/
