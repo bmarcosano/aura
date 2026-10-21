@@ -9,13 +9,13 @@ import cv2
 import mediapipe as mp
 
 from aura.analyzer import PostureAnalyzer
-from aura.calibrator import AutoSplitCalibrator
 from aura.detector import PoseDetector
 from aura.fusion import AuraFusionEngine
 from aura.multi_detector import MultiSkeletonDetector
 
 # Newly created UI and Input modules
 from aura.renderer import AuraRenderer
+from aura.roi_splitter import AutoROISplitter
 from aura.temporal import DTWTemporalAnalyzer
 from aura.utils.input_handler import KeyboardController
 
@@ -47,7 +47,7 @@ class AuraEngine:
         self.mirror_pose_detector = PoseDetector()
         self.posture_analyzer = PostureAnalyzer()
 
-        self.calibrator = AutoSplitCalibrator()
+        self.splitter = AutoROISplitter()
         self.multi_detector = None
         self.fusion_engine = AuraFusionEngine()
         self.dtw_analyzer = DTWTemporalAnalyzer(sensitivity=5.0)
@@ -124,7 +124,7 @@ class AuraEngine:
             # ==========================================
             elif self.current_state == STATE_MIRROR:
                 if self.multi_detector is None:
-                    split_ratio = self.calibrator.update(frame)
+                    split_ratio = self.splitter.update(frame)
                     if split_ratio is not None:
                         self.multi_detector = MultiSkeletonDetector(
                             split_ratio=split_ratio
