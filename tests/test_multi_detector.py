@@ -35,26 +35,37 @@ def test_roi_cropping_logic():
     assert mirror_roi.shape == (480, 320, 3)
 
 
-def test_detect_dual_view(monkeypatch):
+def test_process_frame_basic(monkeypatch):
     """Test dual-view detection pipeline coordinates splitting, flipping, and detector calls."""
     # Arrange
     detector = MultiSkeletonDetector(split_ratio=0.5)
     dummy_frame = np.zeros((480, 640, 3), dtype=np.uint8)
 
-    # Mock detect method on both underlying detectors to isolate multi-detector logic
-    mock_detect_front = MagicMock(return_value="front_landmarks_mock")
-    mock_detect_mirror = MagicMock(return_value="mirror_landmarks_mock")
-
+    # Mock detect methods to isolate multi-detector logic
+    mock_detect_front = MagicMock()
+    mock_detect_mirror = MagicMock()
     monkeypatch.setattr(detector.front_detector, "detect", mock_detect_front)
     monkeypatch.setattr(detector.mirror_detector, "detect", mock_detect_mirror)
 
+    # Mock world landmarks to bypass SVD/validation logic for this basic routing test
+    monkeypatch.setattr(
+        detector.front_detector,
+        "get_world_landmark_array",
+        MagicMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        detector.mirror_detector,
+        "get_world_landmark_array",
+        MagicMock(return_value=None),
+    )
+
     # Act
-    result = detector.detect_dual_view(dummy_frame)
+    result = detector.process_frame(dummy_frame)
 
     # Assert
-    assert result == {
-        "front": "front_landmarks_mock",
-        "mirror": "mirror_landmarks_mock",
-    }
+    assert "front_roi" in result
+    assert "mirror_roi" in result
+    assert "is_valid" in result
+    assert result["is_valid"] is True
     mock_detect_front.assert_called_once()
     mock_detect_mirror.assert_called_once()

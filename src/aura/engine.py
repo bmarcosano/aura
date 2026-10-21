@@ -4,6 +4,7 @@ engine.py: Core application loop and state management for AURA.
 
 import math
 import os
+import sys
 
 import cv2
 import mediapipe as mp
@@ -43,8 +44,6 @@ class AuraEngine:
 
         # --- COMPONENT INITIALIZATION ---
         self.single_detector = PoseDetector()
-        self.front_pose_detector = PoseDetector()
-        self.mirror_pose_detector = PoseDetector()
         self.posture_analyzer = PostureAnalyzer()
 
         self.splitter = AutoROISplitter()
@@ -133,38 +132,29 @@ class AuraEngine:
                     else:
                         cv2.imshow("AURA - Calibration", frame)
                 else:
-                    front_roi, mirror_roi = self.multi_detector._crop_rois(frame)
+                    # Clean delegation to MultiSkeletonDetector
+                    pipeline_data = self.multi_detector.process_frame(frame)
 
-                    if self._is_valid_roi(front_roi) and self._is_valid_roi(mirror_roi):
-                        self.front_pose_detector.detect(front_roi, draw=True)
-                        self.mirror_pose_detector.detect(mirror_roi, draw=True)
+                    front_roi = pipeline_data["front_roi"]
+                    mirror_roi = pipeline_data["mirror_roi"]
+                    active_results = pipeline_data["front_results"]
+                    mirror_results = pipeline_data["mirror_results"]
 
-                        active_frame = front_roi
-                        active_results = getattr(
-                            self.front_pose_detector, "results", None
-                        )
-                        mirror_results = getattr(
-                            self.mirror_pose_detector, "results", None
-                        )
+                    active_frame = front_roi
 
-                        fusion_result = self.fusion_engine.evaluate_posture(
-                            active_results, mirror_results
-                        )
+                    # Fusion evaluation (will handle None mirror_results gracefully if validated failed)
+                    fusion_result = self.fusion_engine.evaluate_posture(
+                        active_results, mirror_results
+                    )
 
-                        # Render the two split HUDs
+                    # Render the two split HUDs
+                    if self._is_valid_roi(front_roi):
                         self.renderer.draw_postural_hud(
                             front_roi,
                             active_results,
                             self.posture_analyzer,
                             is_mirror_view=False,
                         )
-                        self.renderer.draw_postural_hud(
-                            mirror_roi,
-                            mirror_results,
-                            self.posture_analyzer,
-                            is_mirror_view=True,
-                        )
-
                         cv2.putText(
                             front_roi,
                             f"FUSION: {fusion_result['state']}",
@@ -174,6 +164,14 @@ class AuraEngine:
                             fusion_result["color"],
                             2,
                             cv2.LINE_AA,
+                        )
+
+                    if self._is_valid_roi(mirror_roi) and mirror_results:
+                        self.renderer.draw_postural_hud(
+                            mirror_roi,
+                            mirror_results,
+                            self.posture_analyzer,
+                            is_mirror_view=True,
                         )
 
             # ==========================================
@@ -361,3 +359,27 @@ class AuraEngine:
         """Releases hardware resources."""
         self.cap.release()
         cv2.destroyAllWindows()
+
+
+def main():
+    import argparse
+
+    parser = argparse.ArgumentParser(description="AURA Engine")
+    parser.add_argument(
+        "--source", default="0", help="Video source (0 for webcam, or path to video)"
+    )
+    parser.add_argument("--exercise", default="squats", help="Exercise to analyze")
+    args = parser.parse_args()
+
+    try:
+        app = AuraEngine(source=args.source, exercise=args.exercise)
+        app.run()
+    except Exception as e:  # noqa: BLE001
+        print(f"❌ Critical System Failure: {e}")
+        sys.exit(1)
+    finally:
+        print("AURA shutdown complete.")
+
+
+if __name__ == "__main__":
+    main()
