@@ -9,13 +9,13 @@ import cv2
 import mediapipe as mp
 
 from aura.analyzer import PostureAnalyzer
-from aura.roi_splitter import AutoROISplitter
 from aura.detector import PoseDetector
 from aura.fusion import AuraFusionEngine
 from aura.multi_detector import MultiSkeletonDetector
 
 # Newly created UI and Input modules
 from aura.renderer import AuraRenderer
+from aura.roi_splitter import AutoROISplitter
 from aura.temporal import DTWTemporalAnalyzer
 from aura.utils.input_handler import KeyboardController
 

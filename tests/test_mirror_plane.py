@@ -2,8 +2,9 @@
 Unit tests for MirrorPlaneEstimator SVD calculations and geometric transformations.
 """
 
-import pytest
 import numpy as np
+import pytest
+
 from aura.mirror_plane import MirrorPlaneEstimator
 
 
@@ -17,7 +18,7 @@ def generate_synthetic_mirror_points(
     # Random direct points
     np.random.seed(42)
     front_pts = np.random.uniform(-1.0, 1.0, (num_points, 3))
-    
+
     # Mirror points via Householder reflection (P_m = R * P_f + 2 * distance * n)
     # The displacement vector P_f - P_m will be parallel to n.
     mirror_pts = (R @ front_pts.T).T + 2.0 * distance * n
@@ -62,7 +63,7 @@ def test_estimation_empty_history_raises():
 
 def test_estimation_flat_mirror():
     estimator = MirrorPlaneEstimator(history_size=10)
-    
+
     # Mirror perfectly parallel to camera (facing it)
     true_normal = np.array([0.0, 0.0, -1.0])
     pts_f, pts_m = generate_synthetic_mirror_points(num_points=33, normal=true_normal)
@@ -82,7 +83,7 @@ def test_estimation_flat_mirror():
 
 def test_estimation_yaw_tilted_mirror():
     estimator = MirrorPlaneEstimator(history_size=10)
-    
+
     # Mirror rotated 15 degrees around Y axis (Yaw tilt)
     angle_rad = np.radians(15.0)
     # Sin(15) on X, Cos(15) on Z
@@ -102,7 +103,7 @@ def test_estimation_yaw_tilted_mirror():
 
 def test_estimation_pitch_tilted_mirror():
     estimator = MirrorPlaneEstimator(history_size=10)
-    
+
     # Mirror tilted backwards 10 degrees around X axis (Pitch tilt)
     angle_rad = np.radians(10.0)
     true_normal = np.array([0.0, np.sin(angle_rad), -np.cos(angle_rad)])
@@ -127,7 +128,7 @@ def test_reflection_matrix_uncalibrated_raises():
 
 def test_reflection_matrix_properties():
     estimator = MirrorPlaneEstimator(history_size=5)
-    
+
     # Arbitrary complex mirror orientation
     true_normal = np.array([0.2, 0.1, -0.97])
     true_normal /= np.linalg.norm(true_normal)
@@ -142,6 +143,6 @@ def test_reflection_matrix_properties():
 
     # A Householder reflection matrix must be orthogonal (R^T * R = I)
     np.testing.assert_almost_equal(R.T @ R, np.eye(3), decimal=5)
-    
+
     # The determinant of a reflection matrix must be exactly -1
     np.testing.assert_almost_equal(np.linalg.det(R), -1.0, decimal=5)

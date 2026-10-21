@@ -16,7 +16,7 @@ import numpy as np
 class AutoROISplitter:
     """
     Estimates the vertical ROI split ratio by analyzing motion vectors in the frame.
-    
+
     Instead of running heavy deep-learning inference, it employs pixel-level motion analysis
     to detect the two largest moving blobs (user and mirror reflection) and determines the
     optical midpoint.
@@ -53,7 +53,7 @@ class AutoROISplitter:
             frame (np.ndarray): Input BGR image from the camera feed.
 
         Returns:
-            float | None: Averaged normalized split ratio (0.0 to 1.0) when complete, 
+            float | None: Averaged normalized split ratio (0.0 to 1.0) when complete,
                           or None while accumulating data.
         """
         # --- 1. COMPLETION CHECK ---

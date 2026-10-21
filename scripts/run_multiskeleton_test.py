@@ -7,9 +7,9 @@ import sys
 
 import cv2
 
-from aura.roi_splitter import AutoROISplitter
 from aura.detector import PoseDetector
 from aura.multi_detector import MultiSkeletonDetector
+from aura.roi_splitter import AutoROISplitter
 
 
 def main() -> None:
