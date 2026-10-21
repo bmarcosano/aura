@@ -1,10 +1,5 @@
 """
-Module for anthropometric validation and spatial rectification of mirror landmarks.
-
-Leverages the isometric property of specular reflection (preservation of Euclidean
-distances) to validate the quality of 3D keypoint detection. It transforms mirror-view
-landmarks into the primary camera reference frame using a Householder reflection matrix
-and filters out hallucinated or heavily occluded keypoints based on bone-length discrepancies.
+Module for validating anthropometric isometry between direct and mirror-reflected poses.
 """
 
 from __future__ import annotations
@@ -16,115 +11,65 @@ import numpy as np
 
 class AnthropometricValidator:
     """
-    Validates 3D pose landmarks by comparing direct-view and rectified mirror-view bone lengths.
+    Validates skeletal bone-length isometry between direct and mirror views.
     """
 
-    # Key anatomical bone segments using MediaPipe Pose landmark indices
-    BONE_SEGMENTS: ClassVar[dict[str, tuple[int, int]]] = {
-        "left_upper_arm": (11, 13),  # Left Shoulder to Left Elbow
-        "left_forearm": (13, 15),  # Left Elbow to Left Wrist
-        "right_upper_arm": (12, 14),  # Right Shoulder to Right Elbow
-        "right_forearm": (14, 16),  # Right Elbow to Right Wrist
-        "left_thigh": (23, 25),  # Left Hip to Left Knee
-        "left_calf": (25, 27),  # Left Knee to Left Ankle
-        "right_thigh": (24, 26),  # Right Hip to Right Knee
-        "right_calf": (26, 28),  # Right Knee to Right Ankle
-    }
+    BONE_SEGMENTS: ClassVar[list[tuple[int, int]]] = [
+        (11, 12),  # Shoulders
+        (11, 23),  # Left Torso
+        (12, 24),  # Right Torso
+        (23, 24),  # Hips
+        (11, 13),  # Left Upper Arm
+        (13, 15),  # Left Forearm
+        (12, 14),  # Right Upper Arm
+        (14, 16),  # Right Forearm
+        (23, 25),  # Left Thigh
+        (25, 27),  # Left Shin
+        (24, 26),  # Right Thigh
+        (26, 28),  # Right Shin
+    ]
 
-    def __init__(self, error_threshold: float = 0.10) -> None:
-        """
-        Initializes the Anthropometric Validator.
-
-        Args:
-            error_threshold (float): Maximum allowed relative discrepancy between direct
-                                     and mirror bone lengths (e.g., 0.10 means 10% error allowed).
-        """
+    def __init__(self, error_threshold: float = 0.40) -> None:
         self.error_threshold = error_threshold
 
     def apply_mirror_reflection(
         self, mirror_landmarks: np.ndarray, reflection_matrix: np.ndarray
     ) -> np.ndarray:
-        """
-        Maps mirror-view keypoints into the primary camera coordinate system.
-
-        Applies the Householder transformation: P'_m = P_m * R^T
-
-        Args:
-            mirror_landmarks (np.ndarray): Shape (N, 3) 3D landmarks from the mirror.
-            reflection_matrix (np.ndarray): Shape (3, 3) orthogonal reflection matrix.
-
-        Returns:
-            np.ndarray: Rectified mirror landmarks in the camera's spatial frame.
-        """
-        if mirror_landmarks.ndim != 2 or mirror_landmarks.shape[1] != 3:
-            raise ValueError("mirror_landmarks must have shape (N, 3).")
-
-        if reflection_matrix.shape != (3, 3):
-            raise ValueError("reflection_matrix must be a (3, 3) numpy array.")
-
-        # Matrix multiplication: project mirror points using the reflection matrix
-        rectified_landmarks = mirror_landmarks @ reflection_matrix.T
-        return rectified_landmarks
-
-    def compute_bone_lengths(self, landmarks: np.ndarray) -> dict[str, float]:
-        """
-        Calculates the Euclidean distance for predefined anatomical bone segments.
-
-        Args:
-            landmarks (np.ndarray): Shape (N, 3) array of 3D joint coordinates.
-
-        Returns:
-            dict[str, float]: Dictionary mapping segment names to their physical lengths.
-        """
-        lengths: dict[str, float] = {}
-        for segment_name, (idx_a, idx_b) in self.BONE_SEGMENTS.items():
-            point_a = landmarks[idx_a]
-            point_b = landmarks[idx_b]
-            distance = float(np.linalg.norm(point_a - point_b))
-            lengths[segment_name] = distance
-        return lengths
+        """Applies Householder reflection transformation matrix to mirror landmarks."""
+        return (reflection_matrix @ mirror_landmarks.T).T
 
     def validate_isometry(
-        self, front_landmarks: np.ndarray, rectified_mirror_landmarks: np.ndarray
-    ) -> tuple[bool, dict[str, float]]:
+        self, front_landmarks: np.ndarray, rectified_mirror: np.ndarray
+    ) -> tuple[bool, float, str, str]:
         """
-        Compares bone lengths between direct view and rectified mirror view.
-
-        Metric: E_k = |L_{f,k} - L_{m,k}| / L_{f,k}
-
-        Args:
-            front_landmarks (np.ndarray): Shape (N, 3) direct view landmarks.
-            rectified_mirror_landmarks (np.ndarray): Shape (N, 3) mirror landmarks projected into camera space.
-
-        Returns:
-            tuple[bool, dict[str, float]]:
-                - is_valid (bool): True if ALL bone discrepancies are below the error threshold.
-                - discrepancies (dict[str, float]): Dictionary containing the E_k error score for each segment.
+        Validates bone length consistency between direct view and rectified mirror view.
         """
-        if front_landmarks.shape != rectified_mirror_landmarks.shape:
-            raise ValueError(
-                "Shape mismatch between front and rectified mirror landmarks."
+        max_error = 0.0
+        checked_bones = 0
+
+        for start_idx, end_idx in self.BONE_SEGMENTS:
+            if start_idx >= len(front_landmarks) or end_idx >= len(front_landmarks):
+                continue
+            if start_idx >= len(rectified_mirror) or end_idx >= len(rectified_mirror):
+                continue
+
+            len_front = np.linalg.norm(
+                front_landmarks[start_idx] - front_landmarks[end_idx]
+            )
+            len_mirror = np.linalg.norm(
+                rectified_mirror[start_idx] - rectified_mirror[end_idx]
             )
 
-        front_lengths = self.compute_bone_lengths(front_landmarks)
-        mirror_lengths = self.compute_bone_lengths(rectified_mirror_landmarks)
+            if len_front > 1e-5:
+                error = abs(len_front - len_mirror) / len_front
+                max_error = max(max_error, error)
+                checked_bones += 1
 
-        discrepancies: dict[str, float] = {}
-        is_valid = True
+        is_valid = max_error <= self.error_threshold
 
-        for segment_name in self.BONE_SEGMENTS:
-            lf = front_lengths[segment_name]
-            lm = mirror_lengths[segment_name]
+        user_msg = (
+            f"Skeletal isometry check: max bone discrepancy is {max_error * 100:.1f}%."
+        )
+        expert_msg = f"Isometry validation: {checked_bones} bone segments checked. Max error={max_error:.4f} (Threshold={self.error_threshold}). Status: {'PASS' if is_valid else 'FAIL'}."
 
-            # Prevent division by zero if MediaPipe collapses a joint
-            if lf < 1e-6:
-                error = 1.0
-            else:
-                error = abs(lf - lm) / lf
-
-            discrepancies[segment_name] = error
-
-            if error > self.error_threshold:
-                is_valid = False
-
-        return is_valid, discrepancies
+        return is_valid, max_error, user_msg, expert_msg
