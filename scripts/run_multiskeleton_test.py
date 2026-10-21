@@ -7,14 +7,14 @@ import sys
 
 import cv2
 
-from aura.calibrator import AutoSplitCalibrator
+from aura.roi_splitter import AutoROISplitter
 from aura.detector import PoseDetector
 from aura.multi_detector import MultiSkeletonDetector
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Test MultiSkeletonDetector with Auto Calibration on a video or webcam."
+        description="Test MultiSkeletonDetector with Auto splitting on a video or webcam."
     )
     parser.add_argument(
         "--source",
@@ -36,19 +36,19 @@ def main() -> None:
     fps = cap.get(cv2.CAP_PROP_FPS)
     delay = int(1000 / fps) if fps > 0 else 33
 
-    # Initialize the auto-calibrator and pose detectors
-    calibrator = AutoSplitCalibrator()
+    # Initialize the auto-splitter and pose detectors
+    splitter = AutoROISplitter()
     front_pose_detector = PoseDetector()
     mirror_pose_detector = PoseDetector()
 
-    # This will remain None until calibration is successfully completed
+    # This will remain None until auto-splitting is successfully completed
     multi_detector: MultiSkeletonDetector | None = None
 
     print(
         f"🚀 Starting test using source: {source} (FPS: {fps if fps > 0 else 'N/A'})."
     )
     print(
-        "⏳ CALIBRATION PHASE: Analysing motion to find the optimal mirror split line..."
+        "⏳ AUTO-SPLITTING PHASE: Analysing motion to find the optimal mirror split line..."
     )
     print("Press 'q' at any time to exit.")
 
@@ -59,18 +59,18 @@ def main() -> None:
             print("End of video stream or empty frame received.")
             break
 
-        # --- PHASE 1: AUTO-CALIBRATION ---
+        # --- PHASE 1: AUTO-SPLITTING ---
         if multi_detector is None:
-            split_ratio = calibrator.update(frame)
+            split_ratio = splitter.update(frame)
 
             if split_ratio is not None:
                 print(
-                    f"\n✅ Calibration complete! Optimal split ratio locked at: {split_ratio:.3f}"
+                    f"\n✅ Auto-splitting complete! Optimal split ratio locked at: {split_ratio:.3f}"
                 )
                 multi_detector = MultiSkeletonDetector(split_ratio=split_ratio)
-                cv2.destroyWindow("AURA - Calibration")
+                cv2.destroyWindow("AURA - Auto-Splitting")
             else:
-                cv2.imshow("AURA - Calibration", frame)
+                cv2.imshow("AURA - Auto-Splitting", frame)
 
         # --- PHASE 2: DETECTION AND ROI CROPPING ---
         else:
