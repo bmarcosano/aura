@@ -1,10 +1,8 @@
 """
-detector.py: MediaPipe Pose estimation, optical calibration, and webcam stream management.
+detector.py: MediaPipe Pose estimation and webcam stream management.
 """
 
 from __future__ import annotations
-
-import os
 
 import cv2
 import mediapipe as mp
@@ -12,7 +10,7 @@ import numpy as np
 
 
 class PoseDetector:
-    """Handles video capture, optical distortion correction, and real-time 3D pose landmark extraction using MediaPipe."""
+    """Handles video capture and real-time 3D pose landmark extraction using MediaPipe."""
 
     def __init__(
         self,
@@ -21,7 +19,6 @@ class PoseDetector:
         smooth_landmarks: bool = True,
         min_detection_confidence: float = 0.5,
         min_tracking_confidence: float = 0.5,
-        calibration_file: str = "camera_calibration.npz",
     ) -> None:
         # Direct initialization using modern MediaPipe solutions structure
         self.mp_pose = mp.solutions.pose
@@ -36,38 +33,15 @@ class PoseDetector:
         )
 
         self.results = None
-
-        # Load camera calibration parameters if available for optical undistortion
-        self.camera_matrix: np.ndarray | None = None
-        self.dist_coeffs: np.ndarray | None = None
-
-        if os.path.exists(calibration_file):
-            try:
-                data = np.load(calibration_file)
-                self.camera_matrix = data["camera_matrix"]
-                self.dist_coeffs = data["dist_coeffs"]
-                print(
-                    f"✅ Camera calibration loaded from '{calibration_file}'. Undistortion enabled."
-                )
-            except (ValueError, KeyError, OSError) as e:
-                print(f"⚠️ Failed to load calibration file '{calibration_file}': {e}")
-        else:
-            print(
-                "ℹ️ No camera calibration file found. Running without optical undistortion."
-            )
+        print("✅ PoseDetector initialized successfully.")
 
     def detect(self, frame: np.ndarray, draw: bool = True) -> np.ndarray | None:
         """
-        Undistorts the frame (if calibrated), processes via MediaPipe,
-        draws the skeleton overlay, and returns the pixel landmark array.
+        Processes via MediaPipe, draws the skeleton overlay,
+        and returns the pixel landmark array.
         """
-        # Apply optical undistortion if calibration parameters are loaded
-        processed_frame = frame
-        if self.camera_matrix is not None and self.dist_coeffs is not None:
-            processed_frame = cv2.undistort(frame, self.camera_matrix, self.dist_coeffs)
-
-        h, w, _ = processed_frame.shape
-        image_rgb = cv2.cvtColor(processed_frame, cv2.COLOR_BGR2RGB)
+        h, w, _ = frame.shape
+        image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         image_rgb.flags.writeable = False
 
         self.results = self.pose.process(image_rgb)
@@ -77,7 +51,7 @@ class PoseDetector:
         # Draw skeleton lines on the frame if requested and landmarks are found
         if self.results.pose_landmarks and draw:
             self.mp_draw.draw_landmarks(
-                processed_frame,
+                frame,
                 self.results.pose_landmarks,
                 self.mp_pose.POSE_CONNECTIONS,
                 self.mp_draw.DrawingSpec(
@@ -87,10 +61,6 @@ class PoseDetector:
                     color=(0, 0, 255), thickness=2, circle_radius=2
                 ),
             )
-
-        # If processed_frame was undistorted, copy back to the mutable input frame reference
-        if processed_frame is not frame:
-            np.copyto(frame, processed_frame)
 
         return self.get_landmark_array(w, h)
 
