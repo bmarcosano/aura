@@ -47,7 +47,7 @@ def test_add_frame_data_accumulator():
     pts_m = np.ones((10, 3))
 
     for i in range(4):
-        ready = estimator.add_frame_data(pts_f, pts_m)
+        ready, _user_msg, _expert_msg = estimator.add_frame_data(pts_f, pts_m)
         assert not ready
 
     # 5th frame fills the history buffer
@@ -71,7 +71,7 @@ def test_estimation_flat_mirror():
     for _ in range(10):
         estimator.add_frame_data(pts_f, pts_m)
 
-    normal, yaw, pitch = estimator.estimate()
+    normal, yaw, pitch, *_ = estimator.estimate()
 
     assert estimator.is_estimated
     # Check normal vector points strictly along Z axis
@@ -94,7 +94,7 @@ def test_estimation_yaw_tilted_mirror():
     for _ in range(10):
         estimator.add_frame_data(pts_f, pts_m)
 
-    _, yaw, pitch = estimator.estimate()
+    _, yaw, pitch, *_ = estimator.estimate()
 
     # Yaw should be ~15 degrees, Pitch should be 0
     np.testing.assert_almost_equal(yaw, 15.0, decimal=1)
@@ -113,7 +113,7 @@ def test_estimation_pitch_tilted_mirror():
     for _ in range(10):
         estimator.add_frame_data(pts_f, pts_m)
 
-    _, yaw, pitch = estimator.estimate()
+    _, yaw, pitch, *_ = estimator.estimate()
 
     # Yaw should be 0, Pitch should be ~10 degrees
     np.testing.assert_almost_equal(yaw, 0.0, decimal=1)
