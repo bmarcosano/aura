@@ -36,6 +36,14 @@ class AnthropometricValidator:
         self, mirror_landmarks: np.ndarray, reflection_matrix: np.ndarray
     ) -> np.ndarray:
         """Applies Householder reflection transformation matrix to mirror landmarks."""
+        if mirror_landmarks.shape != (33, 3):
+            raise ValueError(
+                "Shape mismatch: mirror_landmarks must have shape (33, 3)."
+            )
+        if reflection_matrix.shape != (3, 3):
+            raise ValueError(
+                "Shape mismatch: reflection_matrix must have shape (3, 3)."
+            )
         return (reflection_matrix @ mirror_landmarks.T).T
 
     def validate_isometry(
@@ -46,7 +54,10 @@ class AnthropometricValidator:
         """
         max_error = 0.0
         checked_bones = 0
-
+        if front_landmarks.shape != (33, 3) or rectified_mirror.shape != (33, 3):
+            raise ValueError(
+                "Shape mismatch: front_landmarks and mirror_landmarks must have shape (33, 3)."
+            )
         for start_idx, end_idx in self.BONE_SEGMENTS:
             if start_idx >= len(front_landmarks) or end_idx >= len(front_landmarks):
                 continue
