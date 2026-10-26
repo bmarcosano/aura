@@ -1,6 +1,10 @@
+"""
+detector.py: MediaPipe Pose estimation, optical calibration, and webcam stream management.
+"""
+
 from __future__ import annotations
 
-"""detector.py: MediaPipe Pose estimation and webcam stream management."""
+import os
 
 import cv2
 import mediapipe as mp
@@ -8,7 +12,7 @@ import numpy as np
 
 
 class PoseDetector:
-    """Handles video capture and real-time 3D pose landmark extraction using MediaPipe."""
+    """Handles video capture, optical distortion correction, and real-time 3D pose landmark extraction using MediaPipe."""
 
     def __init__(
         self,
@@ -17,7 +21,8 @@ class PoseDetector:
         smooth_landmarks: bool = True,
         min_detection_confidence: float = 0.5,
         min_tracking_confidence: float = 0.5,
-    ):
+        calibration_file: str = "camera_calibration.npz",
+    ) -> None:
         # Direct initialization using modern MediaPipe solutions structure
         self.mp_pose = mp.solutions.pose
         self.mp_draw = mp.solutions.drawing_utils
@@ -32,10 +37,37 @@ class PoseDetector:
 
         self.results = None
 
+        # Load camera calibration parameters if available for optical undistortion
+        self.camera_matrix: np.ndarray | None = None
+        self.dist_coeffs: np.ndarray | None = None
+
+        if os.path.exists(calibration_file):
+            try:
+                data = np.load(calibration_file)
+                self.camera_matrix = data["camera_matrix"]
+                self.dist_coeffs = data["dist_coeffs"]
+                print(
+                    f"✅ Camera calibration loaded from '{calibration_file}'. Undistortion enabled."
+                )
+            except (ValueError, KeyError, OSError) as e:
+                print(f"⚠️ Failed to load calibration file '{calibration_file}': {e}")
+        else:
+            print(
+                "ℹ️ No camera calibration file found. Running without optical undistortion."
+            )
+
     def detect(self, frame: np.ndarray, draw: bool = True) -> np.ndarray | None:
-        """Processes an OpenCV frame, draws the skeleton overlay, and returns the landmark array."""
-        h, w, _ = frame.shape
-        image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        """
+        Undistorts the frame (if calibrated), processes via MediaPipe,
+        draws the skeleton overlay, and returns the pixel landmark array.
+        """
+        # Apply optical undistortion if calibration parameters are loaded
+        processed_frame = frame
+        if self.camera_matrix is not None and self.dist_coeffs is not None:
+            processed_frame = cv2.undistort(frame, self.camera_matrix, self.dist_coeffs)
+
+        h, w, _ = processed_frame.shape
+        image_rgb = cv2.cvtColor(processed_frame, cv2.COLOR_BGR2RGB)
         image_rgb.flags.writeable = False
 
         self.results = self.pose.process(image_rgb)
@@ -45,7 +77,7 @@ class PoseDetector:
         # Draw skeleton lines on the frame if requested and landmarks are found
         if self.results.pose_landmarks and draw:
             self.mp_draw.draw_landmarks(
-                frame,
+                processed_frame,
                 self.results.pose_landmarks,
                 self.mp_pose.POSE_CONNECTIONS,
                 self.mp_draw.DrawingSpec(
@@ -55,6 +87,10 @@ class PoseDetector:
                     color=(0, 0, 255), thickness=2, circle_radius=2
                 ),
             )
+
+        # If processed_frame was undistorted, copy back to the mutable input frame reference
+        if processed_frame is not frame:
+            np.copyto(frame, processed_frame)
 
         return self.get_landmark_array(w, h)
 
@@ -67,15 +103,29 @@ class PoseDetector:
     def get_landmark_array(
         self, frame_width: int, frame_height: int
     ) -> np.ndarray | None:
-        """Extracts landmark coordinates (x, y, z, visibility) as a structured NumPy array."""
+        """Extracts landmark coordinates (x, y in pixels, z, visibility) as a NumPy array."""
         if not self.results or not self.results.pose_landmarks:
             return None
 
         landmarks = []
         for lm in self.results.pose_landmarks.landmark:
-            # Map normalized coordinates back to pixel space for x and y; keep z and visibility
+            # Map normalized coordinates back to pixel space for x and y
             landmarks.append(
                 [lm.x * frame_width, lm.y * frame_height, lm.z, lm.visibility]
             )
+
+        return np.array(landmarks, dtype=np.float32)
+
+    def get_world_landmark_array(self) -> np.ndarray | None:
+        """
+        Extracts real-world 3D coordinates (x, y, z in meters) with origin at the hip center.
+        Crucial for SVD mirror plane estimation and anthropometric validation.
+        """
+        if not self.results or not self.results.pose_world_landmarks:
+            return None
+
+        landmarks = []
+        for lm in self.results.pose_world_landmarks.landmark:
+            landmarks.append([lm.x, lm.y, lm.z])
 
         return np.array(landmarks, dtype=np.float32)
