@@ -1,6 +1,7 @@
 """
 engine.py: Core application loop and state management for AURA.
-Includes multi-marker ArUco tracking for absolute spatial anchoring.
+Includes multi-marker ArUco tracking for absolute spatial anchoring,
+dynamic floor grounding, Auto Splitter UI window, and unified 3D Digital Twin.
 """
 
 from __future__ import annotations
@@ -61,7 +62,6 @@ class AuraEngine:
                 self.camera_matrix = data["camera_matrix"]
                 self.dist_coeffs = data["dist_coeffs"]
 
-            # If the source is a video file, prompt the user to decide whether to apply calibration or not
             if isinstance(self.source, int):
                 self.apply_calibration = True
             else:
@@ -75,7 +75,7 @@ class AuraEngine:
                     self.apply_calibration = True
                 print(f"[INFO] Optical calibration set to: {self.apply_calibration}\n")
 
-        # Initialize ArUco tracker (marker size set to 18cm = 0.18m based on latest update)
+        # Initialize ArUco tracker (marker size set to 18cm = 0.18m)
         self.aruco_tracker = ArucoMultiTracker(marker_size_m=0.18)
 
         # --- COMPONENT INITIALIZATION ---
@@ -89,7 +89,7 @@ class AuraEngine:
 
         # UI & Rendering
         self.renderer = AuraRenderer()
-        self.viewer_3d = Aura3DViewer()
+        self.viewer_3d = Aura3DViewer(width=800, height=600)
         self.sys_logger = AuraLogger()
 
         # Silent Split setup
@@ -105,6 +105,91 @@ class AuraEngine:
         self.dtw_last_result = None
         self.frame_count = 0
         self._window_placed = False
+
+    def _ground_landmarks(self, landmarks_3d: np.ndarray | None) -> np.ndarray | None:
+        """
+        Dynamically grounds raw MediaPipe 3D world landmarks onto the floor grid (Y=0) EVERY FRAME.
+        MediaPipe world_landmarks are inherently hip-centered. By calculating the feet centroid
+        dynamically and applying it instantly (without EMA lag), the feet stay perfectly glued
+        to the floor, absorbing the squat naturally without vertical floating or lateral skating.
+        """
+        if landmarks_3d is None or len(landmarks_3d) != 33:
+            return landmarks_3d
+
+        grounded = landmarks_3d.copy()
+        feet_indices = [27, 28, 29, 30, 31, 32]  # Ankles, heels, toes
+
+        # Use np.max for Y to guarantee the absolute lowest physical point touches the floor
+        target_y = float(np.max(grounded[feet_indices, 1]))
+        target_x = float((grounded[27, 0] + grounded[28, 0]) / 2.0)
+        target_z = float((grounded[27, 2] + grounded[28, 2]) / 2.0)
+
+        # Instant subtraction: forces the feet to be locked at X=0, Z=0 and lowest point at Y=0
+        grounded[:, 0] -= target_x
+        grounded[:, 1] -= target_y
+        grounded[:, 2] -= target_z
+
+        return grounded
+
+    def _evaluate_joint_colors(
+        self, active_results, fusion_result: dict | None = None
+    ) -> dict[int, str]:
+        """
+        Evaluates 3D joint posture against biomechanical golden standards and returns a
+        color mapping for rendering joints in the 3D viewport.
+        """
+        joint_colors: dict[int, str] = {}
+
+        if (
+            not active_results
+            or not hasattr(active_results, "pose_landmarks")
+            or not active_results.pose_landmarks
+        ):
+            return joint_colors
+
+        landmarks = active_results.pose_landmarks.landmark
+
+        left_hip = np.array([landmarks[23].x, landmarks[23].y])
+        left_knee = np.array([landmarks[25].x, landmarks[25].y])
+        left_ankle = np.array([landmarks[27].x, landmarks[27].y])
+
+        right_hip = np.array([landmarks[24].x, landmarks[24].y])
+        right_knee = np.array([landmarks[26].x, landmarks[26].y])
+        right_ankle = np.array([landmarks[28].x, landmarks[28].y])
+
+        def compute_angle(a, b, c):
+            ba = a - b
+            bc = c - b
+            cosine_angle = np.dot(ba, bc) / (
+                np.linalg.norm(ba) * np.linalg.norm(bc) + 1e-6
+            )
+            angle = np.arccos(np.clip(cosine_angle, -1.0, 1.0))
+            return np.degrees(angle)
+
+        left_knee_angle = compute_angle(left_hip, left_knee, left_ankle)
+        right_knee_angle = compute_angle(right_hip, right_knee, right_ankle)
+
+        for knee_idx, knee_angle in [(25, left_knee_angle), (26, right_knee_angle)]:
+            if knee_angle < 70.0:
+                joint_colors[knee_idx] = "warning"
+            elif knee_angle > 175.0:
+                joint_colors[knee_idx] = "good"
+            else:
+                joint_colors[knee_idx] = "good"
+
+        if fusion_result and fusion_result.get("state") == "ISOMETRY_INVALID":
+            joint_colors[23] = "bad"
+            joint_colors[24] = "bad"
+            joint_colors[11] = "bad"
+            joint_colors[12] = "bad"
+
+        if self.recording_state == REC_USER and self.dtw_last_result:
+            distance = self.dtw_last_result.get("raw_distance", 0)
+            if distance > 15.0:
+                joint_colors[27] = "warning"
+                joint_colors[28] = "warning"
+
+        return joint_colors
 
     def run(self) -> None:
         """Starts the main video loop."""
@@ -145,27 +230,20 @@ class AuraEngine:
             aruco_poses = {}
             if self.camera_matrix is not None and self.dist_coeffs is not None:
                 if self.apply_calibration:
-                    # Undistort the raw camera feed using saved calibration parameters
                     frame = cv2.undistort(frame, self.camera_matrix, self.dist_coeffs)
-                # Pre-inference ArUco scan: detects markers and overlays 3D coordinate axes
                 frame, aruco_poses = self.aruco_tracker.process_frame(
                     frame, self.camera_matrix, self.dist_coeffs
                 )
 
-            # Spatial Anchoring logic based on ArUco
             if 0 in aruco_poses:
-                # Marker ID 0 (Floor/Origin)
                 _rvec_floor, tvec_floor = aruco_poses[0]
                 floor_dist = np.linalg.norm(tvec_floor)
                 self.sys_logger.log_metric("Floor Dist", f"{floor_dist:.2f} m")
-                # TODO: Inject floor Y-coordinate absolute anchoring in viewer_3d
 
             if 1 in aruco_poses:
-                # Marker ID 1 (Mirror Plane)
                 _rvec_mirror, tvec_mirror = aruco_poses[1]
                 mirror_dist = np.linalg.norm(tvec_mirror)
                 self.sys_logger.log_metric("Mirror Dist", f"{mirror_dist:.2f} m")
-                # TODO: Bypass SVD plane estimation and inject mirror pose directly
 
             _, w = frame.shape[:2]
             active_frame = None
@@ -174,6 +252,7 @@ class AuraEngine:
             mirror_roi = None
             fused_3d = None
             plane_normal = None
+            fusion_result = None
 
             # ==========================================
             # PHASE 2: SINGLE MODE
@@ -184,7 +263,10 @@ class AuraEngine:
 
                 self.single_detector.detect(display_frame, draw=True)
                 active_results = getattr(self.single_detector, "results", None)
-                fused_3d = self.single_detector.get_world_landmark_array()
+
+                # Ground raw single-view 3D landmarks onto floor Y=0 dynamically
+                raw_landmarks = self.single_detector.get_world_landmark_array()
+                fused_3d = self._ground_landmarks(raw_landmarks)
 
                 self.renderer.draw_postural_hud(
                     display_frame,
@@ -200,24 +282,25 @@ class AuraEngine:
             elif self.current_state == STATE_MIRROR:
                 if self.multi_detector is None:
                     split_ratio = self.splitter.update(frame)
+                    window_title = "Auto Splitter: Detecting..."
                     if split_ratio is not None:
                         self.sys_logger.log(
-                            "Calibration successful.",
+                            "Auto Splitter calibration successful.",
                             "AutoROISplitter finalized ratio. Instantiating MultiSkeletonDetector.",
                         )
                         self.multi_detector = MultiSkeletonDetector(
                             split_ratio=split_ratio
                         )
-                        cv2.destroyWindow("AURA - Calibration")
+                        cv2.destroyWindow(window_title)
                     else:
-                        cv2.imshow("AURA - Calibration", frame)
+                        cv2.imshow(window_title, frame)
                         self.single_detector.detect(frame, draw=False)
-                        fused_3d = self.single_detector.get_world_landmark_array()
+                        raw_landmarks = self.single_detector.get_world_landmark_array()
+                        fused_3d = self._ground_landmarks(raw_landmarks)
                         active_frame = frame
                 else:
                     pipeline_data = self.multi_detector.process_frame(frame)
 
-                    # Push internal logs to system logger
                     for user_msg, expert_msg in pipeline_data.get("logs", []):
                         self.sys_logger.log(user_msg, expert_msg)
 
@@ -225,7 +308,23 @@ class AuraEngine:
                     mirror_roi = pipeline_data["mirror_roi"]
                     active_results = pipeline_data["front_results"]
                     mirror_results = pipeline_data["mirror_results"]
-                    fused_3d = pipeline_data["fused_3d"]
+
+                    # Ground raw 3D landmarks from either front view or fused 3D data onto floor Y=0 dynamically
+                    if (
+                        active_results
+                        and hasattr(active_results, "pose_world_landmarks")
+                        and active_results.pose_world_landmarks
+                    ):
+                        front_world_lm = np.array(
+                            [
+                                [lm.x, lm.y, lm.z]
+                                for lm in active_results.pose_world_landmarks.landmark
+                            ]
+                        )
+                        fused_3d = self._ground_landmarks(front_world_lm)
+                    else:
+                        fused_3d = self._ground_landmarks(pipeline_data["fused_3d"])
+
                     plane_normal = pipeline_data["plane_normal"]
 
                     active_frame = front_roi
@@ -279,7 +378,7 @@ class AuraEngine:
                 live_pacing_msg = self.dtw_analyzer.check_live_pacing()
 
             # ==========================================
-            # PHASE 5: UI & 3D RENDER
+            # PHASE 5: UI & UNIFIED 3D DIGITAL TWIN RENDER
             # ==========================================
             if active_frame is not None:
                 has_golden = len(self.dtw_analyzer.golden_reference) > 0
@@ -300,10 +399,13 @@ class AuraEngine:
                 if self._is_valid_roi(mirror_roi):
                     cv2.imshow("AURA - Mirror View", mirror_roi)
 
-            # Render 3D and Logger Windows
+            # Evaluate biomechanical joint colors against golden standard
+            joint_colors = self._evaluate_joint_colors(active_results, fusion_result)
+
+            # Render Single Unified 3D Viewport
             cv2.imshow(
                 "AURA - 3D Digital Twin & SVD Inspector",
-                self.viewer_3d.render_scene(fused_3d, plane_normal),
+                self.viewer_3d.render_scene(fused_3d, plane_normal, joint_colors),
             )
             cv2.imshow("AURA - System Logs", self.sys_logger.render_events())
             cv2.imshow("AURA - Live Telemetry", self.sys_logger.render_metrics())
@@ -317,16 +419,8 @@ class AuraEngine:
             # ==========================================
             cmd, raw_key = KeyboardController.get_command(self.delay)
 
-            if raw_key != -1 and raw_key in (
-                ord("w"),
-                ord("W"),
-                ord("a"),
-                ord("A"),
-                ord("s"),
-                ord("S"),
-                ord("d"),
-                ord("D"),
-            ):
+            # Pass key to 3D Viewer orbit controls (handles Arrow keys & Numpad keys)
+            if raw_key != -1:
                 self.viewer_3d.handle_keyboard(raw_key)
 
             if cmd != "NONE" and not self._handle_commands(cmd):
