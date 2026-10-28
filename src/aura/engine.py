@@ -1,10 +1,12 @@
 """
 engine.py: Core application loop and state management for AURA.
+Includes multi-marker ArUco tracking for absolute spatial anchoring.
 """
 
 from __future__ import annotations
 
 import math
+import os
 
 import cv2
 import mediapipe as mp
@@ -16,11 +18,14 @@ from aura.fusion import AuraFusionEngine
 from aura.logger import AuraLogger
 from aura.multi_detector import MultiSkeletonDetector
 
-# Newly created UI and Input modules
+# UI and Input modules
 from aura.renderer import AuraRenderer
 from aura.renderer_3d import Aura3DViewer
 from aura.roi_splitter import AutoROISplitter
 from aura.temporal import DTWTemporalAnalyzer
+
+# Aruco Tracking for absolute spatial metrology
+from aura.utils.aruco_tracker import ArucoMultiTracker
 from aura.utils.input_handler import KeyboardController
 
 # State Constants
@@ -32,7 +37,7 @@ REC_USER = "RECORD_USER"
 
 
 class AuraEngine:
-    """Orchestrates the camera feed, biomechanical models, and UI rendering."""
+    """Orchestrates the camera feed, biomechanical models, ArUco tracking, and UI rendering."""
 
     def __init__(self, source: str | int = "0", exercise: str = "squats") -> None:
         self.source = int(source) if str(source).isdigit() else source
@@ -44,6 +49,34 @@ class AuraEngine:
 
         fps = self.cap.get(cv2.CAP_PROP_FPS)
         self.delay = int(1000 / fps) if fps > 0 else 33
+
+        # --- CAMERA CALIBRATION & ARUCO ---
+        self.camera_matrix = None
+        self.dist_coeffs = None
+        self.apply_calibration = False
+
+        calib_path = "camera_calibration.npz"
+        if os.path.exists(calib_path):
+            with np.load(calib_path) as data:
+                self.camera_matrix = data["camera_matrix"]
+                self.dist_coeffs = data["dist_coeffs"]
+
+            # If the source is a video file, prompt the user to decide whether to apply calibration or not
+            if isinstance(self.source, int):
+                self.apply_calibration = True
+            else:
+                print(f"\n[INFO] Video source detected: {self.source}")
+                ans = (
+                    input("Apply optical calibration (undistort)? [y/N]: ")
+                    .strip()
+                    .lower()
+                )
+                if ans == "y":
+                    self.apply_calibration = True
+                print(f"[INFO] Optical calibration set to: {self.apply_calibration}\n")
+
+        # Initialize ArUco tracker (marker size set to 18cm = 0.18m based on latest update)
+        self.aruco_tracker = ArucoMultiTracker(marker_size_m=0.18)
 
         # --- COMPONENT INITIALIZATION ---
         self.single_detector = PoseDetector()
@@ -75,8 +108,16 @@ class AuraEngine:
 
     def run(self) -> None:
         """Starts the main video loop."""
+
+        init_log = "AURA System Initialized. Looking for user..."
+        if self.camera_matrix is not None:
+            status = "applied" if self.apply_calibration else "loaded (not applied)"
+            init_log = (
+                f"AURA Initialized. Calibration file {status}. Looking for user..."
+            )
+
         self.sys_logger.log(
-            "AURA System Initialized. Looking for user...",
+            init_log,
             f"AuraEngine booted. Source: {self.source}, Target: {self.exercise}. FSM State: {STATE_SINGLE}.",
         )
 
@@ -99,6 +140,33 @@ class AuraEngine:
                     break
 
             self.frame_count += 1
+
+            # --- PHASE 1: OPTICAL CORRECTION AND ARUCO TRACKING ---
+            aruco_poses = {}
+            if self.camera_matrix is not None and self.dist_coeffs is not None:
+                if self.apply_calibration:
+                    # Undistort the raw camera feed using saved calibration parameters
+                    frame = cv2.undistort(frame, self.camera_matrix, self.dist_coeffs)
+                # Pre-inference ArUco scan: detects markers and overlays 3D coordinate axes
+                frame, aruco_poses = self.aruco_tracker.process_frame(
+                    frame, self.camera_matrix, self.dist_coeffs
+                )
+
+            # Spatial Anchoring logic based on ArUco
+            if 0 in aruco_poses:
+                # Marker ID 0 (Floor/Origin)
+                _rvec_floor, tvec_floor = aruco_poses[0]
+                floor_dist = np.linalg.norm(tvec_floor)
+                self.sys_logger.log_metric("Floor Dist", f"{floor_dist:.2f} m")
+                # TODO: Inject floor Y-coordinate absolute anchoring in viewer_3d
+
+            if 1 in aruco_poses:
+                # Marker ID 1 (Mirror Plane)
+                _rvec_mirror, tvec_mirror = aruco_poses[1]
+                mirror_dist = np.linalg.norm(tvec_mirror)
+                self.sys_logger.log_metric("Mirror Dist", f"{mirror_dist:.2f} m")
+                # TODO: Bypass SVD plane estimation and inject mirror pose directly
+
             _, w = frame.shape[:2]
             active_frame = None
             active_results = None
@@ -108,7 +176,7 @@ class AuraEngine:
             plane_normal = None
 
             # ==========================================
-            # PHASE 1: SINGLE MODE
+            # PHASE 2: SINGLE MODE
             # ==========================================
             if self.current_state == STATE_SINGLE:
                 display_frame = frame.copy()
@@ -127,7 +195,7 @@ class AuraEngine:
                 self._check_silent_split(frame, w)
 
             # ==========================================
-            # PHASE 2: MIRROR MODE
+            # PHASE 3: MIRROR MODE
             # ==========================================
             elif self.current_state == STATE_MIRROR:
                 if self.multi_detector is None:
@@ -193,7 +261,7 @@ class AuraEngine:
                         )
 
             # ==========================================
-            # PHASE 3: DTW EXTRACTION & PACING
+            # PHASE 4: DTW EXTRACTION & PACING
             # ==========================================
             if (
                 active_results
@@ -211,7 +279,7 @@ class AuraEngine:
                 live_pacing_msg = self.dtw_analyzer.check_live_pacing()
 
             # ==========================================
-            # PHASE 4: UI & 3D RENDER
+            # PHASE 5: UI & 3D RENDER
             # ==========================================
             if active_frame is not None:
                 has_golden = len(self.dtw_analyzer.golden_reference) > 0
@@ -237,7 +305,8 @@ class AuraEngine:
                 "AURA - 3D Digital Twin & SVD Inspector",
                 self.viewer_3d.render_scene(fused_3d, plane_normal),
             )
-            cv2.imshow("AURA - System Logs", self.sys_logger.render())
+            cv2.imshow("AURA - System Logs", self.sys_logger.render_events())
+            cv2.imshow("AURA - Live Telemetry", self.sys_logger.render_metrics())
 
             if not self._window_placed:
                 cv2.moveWindow("AURA - System Logs", 0, 0)

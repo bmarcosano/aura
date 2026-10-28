@@ -27,7 +27,7 @@ class MultiSkeletonDetector:
 
         self.plane_estimator = MirrorPlaneEstimator(history_size=90)
         self.validator = AnthropometricValidator(error_threshold=error_threshold)
-        self.reconstructor = PoseReconstructor(confidence_weight=0.5)
+        self.reconstructor = PoseReconstructor(confidence_weight=0.5, alpha=0.4)
 
     def _crop_rois(self, frame: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         _, w, _ = frame.shape
@@ -114,7 +114,8 @@ class MultiSkeletonDetector:
                                     f"Isometry threshold exceeded (err={max_err:.4f}). Forcing reconstruction fallback.",
                                 )
                             )
-                            is_valid = True
+                            # Permettiamo comunque la fusione (il reconstructor scarterà il mirror_world corrotto)
+                            is_valid = False
 
                     except (ValueError, RuntimeError) as e:
                         logs.append(
@@ -123,9 +124,10 @@ class MultiSkeletonDetector:
                                 f"Exception in isometry validation: {e}",
                             )
                         )
-                        mirror_results = None
+                        rectified_mirror = None
                         is_valid = False
 
+                # 3D Fusion with EMA smoothing
                 fused_3d = self.reconstructor.fuse_landmarks(
                     front_landmarks=front_world,
                     rectified_mirror_landmarks=rectified_mirror,
@@ -136,17 +138,34 @@ class MultiSkeletonDetector:
                 logs.append(
                     (
                         "Unified 3D Digital Twin successfully constructed.",
-                        f"PoseReconstructor fused {len(front_world)} joints using visibility weights.",
+                        f"PoseReconstructor fused 3D data with EMA smoothing (alpha={self.reconstructor.alpha}).",
                     )
                 )
         elif front_results:
-            fused_3d = self.front_detector.get_world_landmark_array()
+            # Fallback: Only front view available, use it directly
+            front_world = self.front_detector.get_world_landmark_array()
+            fused_3d = self.reconstructor.fuse_landmarks(
+                front_landmarks=front_world,
+                rectified_mirror_landmarks=None,
+                front_visibility=front_vis,
+                mirror_visibility=None,
+                is_anthropometrically_valid=False,
+            )
             logs.append(
                 (
                     "Mirror view unavailable. Using direct front-view 3D landmarks.",
-                    "Single-view fallback activated. Fused 3D populated exclusively from front detector.",
+                    "Single-view fallback activated. Fused 3D populated exclusively from front detector with EMA.",
                 )
             )
+        else:
+            # Reset smoothing if no valid detections are available
+            logs.append(
+                (
+                    "No valid detections available. Resetting EMA smoothing state.",
+                    "Both front and mirror detectors failed to produce valid landmarks. Clearing previous fused state.",
+                )
+            )
+            self.reconstructor.reset_smoothing()
 
         return {
             "front_roi": front_roi,
