@@ -1,7 +1,8 @@
 """
 engine.py: Core application loop and state management for AURA.
 Includes multi-marker ArUco tracking for absolute spatial anchoring,
-dynamic floor grounding, Auto Splitter UI window, and unified 3D Digital Twin.
+Markerless SVD Fallback, dynamic floor grounding, Auto Splitter UI window,
+and unified 3D Digital Twin rendering.
 """
 
 from __future__ import annotations
@@ -15,9 +16,12 @@ import numpy as np
 
 from aura.analyzer import PostureAnalyzer
 from aura.detector import PoseDetector
-from aura.fusion import AuraFusionEngine
 from aura.logger import AuraLogger
-from aura.multi_detector import MultiSkeletonDetector
+from aura.mirror_plane import MirrorPlaneEstimator
+
+# New Refactored Modules
+from aura.multi_detector import AnthropometricValidator, MultiSkeletonDetector
+from aura.reconstruction import StereoReconstructor
 
 # UI and Input modules
 from aura.renderer import AuraRenderer
@@ -51,31 +55,60 @@ class AuraEngine:
         fps = self.cap.get(cv2.CAP_PROP_FPS)
         self.delay = int(1000 / fps) if fps > 0 else 33
 
+        frame_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        frame_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
         # --- CAMERA CALIBRATION & ARUCO ---
         self.camera_matrix = None
         self.dist_coeffs = None
         self.apply_calibration = False
 
+        loaded_camera_matrix = None
+        loaded_dist_coeffs = None
         calib_path = "camera_calibration.npz"
+
         if os.path.exists(calib_path):
             with np.load(calib_path) as data:
-                self.camera_matrix = data["camera_matrix"]
-                self.dist_coeffs = data["dist_coeffs"]
+                loaded_camera_matrix = data["camera_matrix"]
+                loaded_dist_coeffs = data["dist_coeffs"]
 
-            if isinstance(self.source, int):
+        if isinstance(self.source, int):
+            # Physical webcam: default to applying calibration if available
+            if loaded_camera_matrix is not None:
                 self.apply_calibration = True
+                self.camera_matrix = loaded_camera_matrix
+                self.dist_coeffs = loaded_dist_coeffs
+        else:
+            # Video file: prompt the user, as the physical lens might not match the video
+            print(f"\n[INFO] Video source detected: {self.source}")
+            ans = (
+                input("Apply optical calibration (undistort)? [y/N]: ").strip().lower()
+            )
+            if ans == "y" and loaded_camera_matrix is not None:
+                self.apply_calibration = True
+                self.camera_matrix = loaded_camera_matrix
+                self.dist_coeffs = loaded_dist_coeffs
             else:
-                print(f"\n[INFO] Video source detected: {self.source}")
-                ans = (
-                    input("Apply optical calibration (undistort)? [y/N]: ")
-                    .strip()
-                    .lower()
-                )
-                if ans == "y":
-                    self.apply_calibration = True
-                print(f"[INFO] Optical calibration set to: {self.apply_calibration}\n")
+                self.apply_calibration = False
 
-        # Initialize ArUco tracker (marker size set to 18cm = 0.18m)
+        # Fallback: Generate a generic pinhole camera matrix for synthetic or uncalibrated video
+        # This prevents solvePnP and triangulation from failing due to mismatched focal lengths.
+        if self.camera_matrix is None:
+            focal_length = float(frame_width)
+            self.camera_matrix = np.array(
+                [
+                    [focal_length, 0, frame_width / 2.0],
+                    [0, focal_length, frame_height / 2.0],
+                    [0, 0, 1],
+                ],
+                dtype=np.float32,
+            )
+            self.dist_coeffs = np.zeros((4, 1), dtype=np.float32)
+            print(
+                f"[INFO] Using generic pinhole camera matrix (Focal length: {focal_length}).\n"
+            )
+
+        # Initialize ArUco tracker (marker size accurately set to 18cm = 0.18m)
         self.aruco_tracker = ArucoMultiTracker(marker_size_m=0.18)
 
         # --- COMPONENT INITIALIZATION ---
@@ -84,7 +117,14 @@ class AuraEngine:
 
         self.splitter = AutoROISplitter()
         self.multi_detector: MultiSkeletonDetector | None = None
-        self.fusion_engine = AuraFusionEngine()
+
+        # Structural Subsystems
+        self.reconstructor: StereoReconstructor | None = None
+        if self.camera_matrix is not None:
+            self.reconstructor = StereoReconstructor(self.camera_matrix)
+
+        self.svd_estimator = MirrorPlaneEstimator(ema_alpha=0.15)
+        self.validator = AnthropometricValidator(units="meters")
         self.dtw_analyzer = DTWTemporalAnalyzer(sensitivity=5.0)
 
         # UI & Rendering
@@ -92,7 +132,7 @@ class AuraEngine:
         self.viewer_3d = Aura3DViewer(width=800, height=600)
         self.sys_logger = AuraLogger()
 
-        # Silent Split setup
+        # Silent Split setup (Temporal coherence validation)
         mp_pose = mp.solutions.pose
         self.silent_checker_left = mp_pose.Pose(min_detection_confidence=0.5)
         self.silent_checker_right = mp_pose.Pose(min_detection_confidence=0.5)
@@ -108,10 +148,9 @@ class AuraEngine:
 
     def _ground_landmarks(self, landmarks_3d: np.ndarray | None) -> np.ndarray | None:
         """
-        Dynamically grounds raw MediaPipe 3D world landmarks onto the floor grid (Y=0) EVERY FRAME.
-        MediaPipe world_landmarks are inherently hip-centered. By calculating the feet centroid
-        dynamically and applying it instantly (without EMA lag), the feet stay perfectly glued
-        to the floor, absorbing the squat naturally without vertical floating or lateral skating.
+        Dynamically grounds raw 3D world landmarks onto the floor grid (Y=0) every frame.
+        Finds the absolute lowest point of the feet and forces it to Y=0, absorbing
+        the squat dynamically without vertical floating.
         """
         if landmarks_3d is None or len(landmarks_3d) != 33:
             return landmarks_3d
@@ -119,12 +158,12 @@ class AuraEngine:
         grounded = landmarks_3d.copy()
         feet_indices = [27, 28, 29, 30, 31, 32]  # Ankles, heels, toes
 
-        # Use np.max for Y to guarantee the absolute lowest physical point touches the floor
+        # Use np.max for Y to guarantee the lowest physical point touches the floor
         target_y = float(np.max(grounded[feet_indices, 1]))
         target_x = float((grounded[27, 0] + grounded[28, 0]) / 2.0)
         target_z = float((grounded[27, 2] + grounded[28, 2]) / 2.0)
 
-        # Instant subtraction: forces the feet to be locked at X=0, Z=0 and lowest point at Y=0
+        # Instant subtraction locks the feet centroid at (X=0, Z=0) and height Y=0
         grounded[:, 0] -= target_x
         grounded[:, 1] -= target_y
         grounded[:, 2] -= target_z
@@ -132,11 +171,11 @@ class AuraEngine:
         return grounded
 
     def _evaluate_joint_colors(
-        self, active_results, fusion_result: dict | None = None
+        self, active_results, is_fused_valid: bool = True
     ) -> dict[int, str]:
         """
-        Evaluates 3D joint posture against biomechanical golden standards and returns a
-        color mapping for rendering joints in the 3D viewport.
+        Evaluates 3D joint posture against biomechanical thresholds and temporal DTW,
+        returning a color mapping for the 3D viewport joints.
         """
         joint_colors: dict[int, str] = {}
 
@@ -177,15 +216,23 @@ class AuraEngine:
             else:
                 joint_colors[knee_idx] = "good"
 
-        if fusion_result and fusion_result.get("state") == "ISOMETRY_INVALID":
+        if not is_fused_valid:
             joint_colors[23] = "bad"
             joint_colors[24] = "bad"
             joint_colors[11] = "bad"
             joint_colors[12] = "bad"
 
         if self.recording_state == REC_USER and self.dtw_last_result:
-            distance = self.dtw_last_result.get("raw_distance", 0)
-            if distance > 15.0:
+            distance = 0.0
+            if isinstance(self.dtw_last_result, dict):
+                distance = self.dtw_last_result.get("deviation_per_frame", 0)
+            elif (
+                isinstance(self.dtw_last_result, tuple)
+                and len(self.dtw_last_result) > 0
+            ):
+                distance = self.dtw_last_result[0]
+
+            if distance > 1.5:
                 joint_colors[27] = "warning"
                 joint_colors[28] = "warning"
 
@@ -228,12 +275,23 @@ class AuraEngine:
 
             # --- PHASE 1: OPTICAL CORRECTION AND ARUCO TRACKING ---
             aruco_poses = {}
+            active_dist_coeffs = np.zeros((4, 1), dtype=np.float32)
+
             if self.camera_matrix is not None and self.dist_coeffs is not None:
                 if self.apply_calibration:
+                    # Physically undistort the frame using calibration data
                     frame = cv2.undistort(frame, self.camera_matrix, self.dist_coeffs)
+                else:
+                    # Frame remains distorted, pass native coefficients for tracking math
+                    active_dist_coeffs = self.dist_coeffs
+
                 frame, aruco_poses = self.aruco_tracker.process_frame(
-                    frame, self.camera_matrix, self.dist_coeffs
+                    frame, self.camera_matrix, active_dist_coeffs
                 )
+
+            # Extract ArUco tracking data for Mirror Plane
+            aruco_rvec = None
+            aruco_tvec = None
 
             if 0 in aruco_poses:
                 _rvec_floor, tvec_floor = aruco_poses[0]
@@ -241,8 +299,8 @@ class AuraEngine:
                 self.sys_logger.log_metric("Floor Dist", f"{floor_dist:.2f} m")
 
             if 1 in aruco_poses:
-                _rvec_mirror, tvec_mirror = aruco_poses[1]
-                mirror_dist = np.linalg.norm(tvec_mirror)
+                aruco_rvec, aruco_tvec = aruco_poses[1]
+                mirror_dist = np.linalg.norm(aruco_tvec)
                 self.sys_logger.log_metric("Mirror Dist", f"{mirror_dist:.2f} m")
 
             _, w = frame.shape[:2]
@@ -252,7 +310,9 @@ class AuraEngine:
             mirror_roi = None
             fused_3d = None
             plane_normal = None
-            fusion_result = None
+
+            is_stereo_validated = False
+            hud_status = "3D FUSION: SINGLE"
 
             # ==========================================
             # PHASE 2: SINGLE MODE
@@ -264,7 +324,6 @@ class AuraEngine:
                 self.single_detector.detect(display_frame, draw=True)
                 active_results = getattr(self.single_detector, "results", None)
 
-                # Ground raw single-view 3D landmarks onto floor Y=0 dynamically
                 raw_landmarks = self.single_detector.get_world_landmark_array()
                 fused_3d = self._ground_landmarks(raw_landmarks)
 
@@ -277,7 +336,7 @@ class AuraEngine:
                 self._check_silent_split(frame, w)
 
             # ==========================================
-            # PHASE 3: MIRROR MODE
+            # PHASE 3: MIRROR MODE (THE NEW PIPELINE)
             # ==========================================
             elif self.current_state == STATE_MIRROR:
                 if self.multi_detector is None:
@@ -299,6 +358,7 @@ class AuraEngine:
                         fused_3d = self._ground_landmarks(raw_landmarks)
                         active_frame = frame
                 else:
+                    # 1. Extract 2D Pixel Landmarks
                     pipeline_data = self.multi_detector.process_frame(frame)
 
                     for user_msg, expert_msg in pipeline_data.get("logs", []):
@@ -309,30 +369,79 @@ class AuraEngine:
                     active_results = pipeline_data["front_results"]
                     mirror_results = pipeline_data["mirror_results"]
 
-                    # Ground raw 3D landmarks from either front view or fused 3D data onto floor Y=0 dynamically
-                    if (
-                        active_results
-                        and hasattr(active_results, "pose_world_landmarks")
-                        and active_results.pose_world_landmarks
-                    ):
-                        front_world_lm = np.array(
-                            [
-                                [lm.x, lm.y, lm.z]
-                                for lm in active_results.pose_world_landmarks.landmark
-                            ]
-                        )
-                        fused_3d = self._ground_landmarks(front_world_lm)
-                    else:
-                        fused_3d = self._ground_landmarks(pipeline_data["fused_3d"])
-
-                    plane_normal = pipeline_data["plane_normal"]
+                    direct_pose_2d = pipeline_data.get("direct_pose_2d")
+                    reflected_pose_2d = pipeline_data.get("reflected_pose_2d")
 
                     active_frame = front_roi
+                    reflection_matrix = None
 
-                    fusion_result = self.fusion_engine.evaluate_posture(
-                        active_results, mirror_results
-                    )
+                    # 2. Attempt Full Stereoscopic Pipeline (Priority Route)
+                    if (
+                        direct_pose_2d is not None
+                        and reflected_pose_2d is not None
+                        and self.reconstructor is not None
+                    ):
+                        direct_3d_local = self.multi_detector.front_detector.get_world_landmark_array()
+                        reflected_3d_local = self.multi_detector.mirror_detector.get_world_landmark_array()
 
+                        # --- PLANE ESTIMATION ---
+                        if aruco_rvec is not None and aruco_tvec is not None:
+                            # Mode 1: Exact ArUco Tracker Metric Plane (Physical Setup)
+                            mirror_data = self.aruco_tracker.estimate_mirror_plane(
+                                aruco_rvec, aruco_tvec
+                            )
+                            reflection_matrix = mirror_data["reflection_matrix"]
+                            plane_normal = mirror_data["normal"]
+                            hud_status = "3D FUSION: STEREO (ARUCO)"
+                        else:
+                            # Mode 2: SVD Markerless Fallback (Synthetic/Uncalibrated Video)
+                            if (
+                                direct_3d_local is not None
+                                and reflected_3d_local is not None
+                            ):
+                                # In synthetic video, MediaPipe's world landmarks are usually upright.
+                                # We revert the mirror's horizontal flip to restore spatial symmetry
+                                reflected_3d_unflipped = reflected_3d_local.copy()
+                                reflected_3d_unflipped[:, 0] *= -1
+
+                                # Calculate the mirror plane directly from the relative 3D vectors
+                                # without attempting to project them into camera space via solvePnP
+                                reflection_matrix, plane_normal = (
+                                    self.svd_estimator.estimate_plane(
+                                        direct_3d_local, reflected_3d_unflipped
+                                    )
+                                )
+
+                                # In purely uncalibrated scenarios, the SVD plane often rests at Z=0.
+                                # We add a small artificial depth (e.g., 2 meters) to the translation
+                                # vector so the triangulated points don't collapse into the camera lens.
+                                if reflection_matrix is not None:
+                                    reflection_matrix[2, 3] = 2.0
+                                    hud_status = "3D FUSION: STEREO (SVD)"
+
+                        # --- TRIANGULATION & CORRECTION ---
+                        if reflection_matrix is not None:
+                            raw_landmarks_3d = self.reconstructor.triangulate_landmarks(
+                                direct_pose_2d, reflected_pose_2d, reflection_matrix
+                            )
+
+                            # Validate metric integrity against anatomical thresholds
+                            if self.validator.validate_skeleton_3d(raw_landmarks_3d):
+                                fused_3d = self._ground_landmarks(raw_landmarks_3d)
+                                is_stereo_validated = True
+                            else:
+                                self.sys_logger.log(
+                                    "Biometric invalidation.",
+                                    "AnthropometricValidator rejected 3D lengths. Falling back to single view.",
+                                )
+
+                    # 3. Fallback Route (Base Frontal Pose)
+                    if not is_stereo_validated and active_results:
+                        front_world_lm = self.multi_detector.front_detector.get_world_landmark_array()
+                        fused_3d = self._ground_landmarks(front_world_lm)
+                        hud_status = "3D FUSION: SINGLE"
+
+                    # HUD Drawing
                     if self._is_valid_roi(front_roi):
                         self.renderer.draw_postural_hud(
                             front_roi,
@@ -342,11 +451,11 @@ class AuraEngine:
                         )
                         cv2.putText(
                             front_roi,
-                            f"FUSION: {fusion_result['state']}",
+                            hud_status,
                             (15, 175),
                             cv2.FONT_HERSHEY_SIMPLEX,
                             0.6,
-                            fusion_result["color"],
+                            (0, 255, 0) if is_stereo_validated else (0, 0, 255),
                             2,
                             cv2.LINE_AA,
                         )
@@ -360,18 +469,27 @@ class AuraEngine:
                         )
 
             # ==========================================
-            # PHASE 4: DTW EXTRACTION & PACING
+            # PHASE 4: KINEMATIC EXTRACTION & PACING
             # ==========================================
-            if (
-                active_results
-                and hasattr(active_results, "pose_landmarks")
-                and active_results.pose_landmarks
-            ):
-                nose_y = active_results.pose_landmarks.landmark[0].y
-                if self.recording_state == REC_GOLDEN:
-                    self.dtw_analyzer.golden_reference.append(nose_y)
-                elif self.recording_state == REC_USER:
-                    self.dtw_analyzer.add_user_frame(nose_y)
+            # Protect Golden Standard recordings from single-view relative estimations
+            if fused_3d is not None:
+                if is_stereo_validated or self.current_state == STATE_SINGLE:
+                    kinematic_features = self.dtw_analyzer.extract_kinematic_features(
+                        fused_3d
+                    )
+
+                    if self.recording_state == REC_GOLDEN:
+                        self.dtw_analyzer.golden_reference.append(
+                            kinematic_features.tolist()
+                        )
+                    elif self.recording_state == REC_USER:
+                        self.dtw_analyzer.add_user_frame(kinematic_features)
+                else:
+                    if self.recording_state in [REC_GOLDEN, REC_USER]:
+                        self.sys_logger.log(
+                            "Warning: Frame dropped from recording.",
+                            "Stereo triangulation inactive. Cannot record monocular fallback into Golden Standard.",
+                        )
 
             live_pacing_msg = ""
             if self.recording_state == REC_USER:
@@ -399,10 +517,10 @@ class AuraEngine:
                 if self._is_valid_roi(mirror_roi):
                     cv2.imshow("AURA - Mirror View", mirror_roi)
 
-            # Evaluate biomechanical joint colors against golden standard
-            joint_colors = self._evaluate_joint_colors(active_results, fusion_result)
+            joint_colors = self._evaluate_joint_colors(
+                active_results, is_stereo_validated
+            )
 
-            # Render Single Unified 3D Viewport
             cv2.imshow(
                 "AURA - 3D Digital Twin & SVD Inspector",
                 self.viewer_3d.render_scene(fused_3d, plane_normal, joint_colors),
@@ -419,7 +537,6 @@ class AuraEngine:
             # ==========================================
             cmd, raw_key = KeyboardController.get_command(self.delay)
 
-            # Pass key to 3D Viewer orbit controls (handles Arrow keys & Numpad keys)
             if raw_key != -1:
                 self.viewer_3d.handle_keyboard(raw_key)
 
@@ -434,6 +551,7 @@ class AuraEngine:
         )
 
     def _check_silent_split(self, frame: np.ndarray, w: int) -> None:
+        """Evaluates Pearson correlation between the two halves to trigger the MIRROR_MODE."""
         if self.frame_count % 10 != 0:
             return
 
@@ -540,9 +658,18 @@ class AuraEngine:
                 )
                 if self.recording_state == REC_USER:
                     self.dtw_last_result = self.dtw_analyzer.evaluate_technique()
+
+                    raw_dist = 0.0
+                    if isinstance(self.dtw_last_result, dict):
+                        raw_dist = self.dtw_last_result.get("raw_distance", 0)
+                    elif (
+                        isinstance(self.dtw_last_result, tuple)
+                        and len(self.dtw_last_result) > 1
+                    ):
+                        raw_dist = self.dtw_last_result[1]
+
                     self.sys_logger.log(
-                        "Analysis complete.",
-                        f"DTW Path Cost Distance: {self.dtw_last_result.get('raw_distance', 0):.2f}",
+                        "Analysis complete.", f"DTW Path Cost Distance: {raw_dist:.2f}"
                     )
                 self.recording_state = REC_IDLE
         elif cmd == "SAVE_GOLDEN":

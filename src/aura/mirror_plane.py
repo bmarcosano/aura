@@ -12,7 +12,15 @@ class MirrorPlaneEstimator:
     Estimates the spatial plane of a mirror using SVD on landmark displacement vectors.
     """
 
-    def __init__(self, history_size: int = 90) -> None:
+    def __init__(self, ema_alpha: float = 0.15, history_size: int = 90) -> None:
+        """
+        Initializes the MirrorPlaneEstimator.
+
+        Args:
+            ema_alpha: Smoothing factor for the Exponential Moving Average filter.
+            history_size: Number of frames to keep in the history buffer.
+        """
+        self.ema_alpha: float = ema_alpha
         self.history_size: int = history_size
         self._diff_history: list[np.ndarray] = []
 
@@ -21,6 +29,9 @@ class MirrorPlaneEstimator:
         self.yaw_deg: float = 0.0
         self.pitch_deg: float = 0.0
         self._reflection_matrix: np.ndarray | None = None
+
+        self.ema_normal = None
+        self.ema_centroid = None
 
     def add_frame_data(
         self, front_landmarks: np.ndarray, mirror_landmarks: np.ndarray
@@ -94,3 +105,70 @@ class MirrorPlaneEstimator:
 
     def is_calibrated_state(self) -> bool:
         return self.is_estimated
+
+    def estimate_plane(
+        self, direct_lms_3d: np.ndarray, reflected_lms_3d: np.ndarray
+    ) -> tuple[np.ndarray | None, np.ndarray | None]:
+        """
+        Calculates the 4x4 reflection matrix given two (N, 3) numpy arrays of landmarks.
+        Uses an Exponential Moving Average (EMA) filter for stability.
+
+        Args:
+             direct_lms_3d: 3D coordinates from the direct view.
+             reflected_lms_3d: 3D coordinates from the reflected view.
+
+        Returns:
+             A tuple containing the 4x4 reflection matrix and the normal vector.
+             Returns (None, None) if not enough landmarks are provided.
+        """
+        if len(direct_lms_3d) < 3 or len(reflected_lms_3d) < 3:
+            return None, None
+
+        # 1. Midpoints: physically lie on the mirror plane
+        midpoints = (direct_lms_3d + reflected_lms_3d) / 2.0
+
+        # 2. Centroid of the midpoints
+        centroid = np.mean(midpoints, axis=0)
+
+        # 3. Center points for SVD
+        centered_midpoints = midpoints - centroid
+
+        # 4. SVD: the normal is the vector with the smallest variance (last row of Vt)
+        _U, _S, Vt = np.linalg.svd(centered_midpoints)
+        normal = Vt[-1, :]
+
+        # Ensure normal points towards the camera (Z > 0)
+        if normal[2] < 0:
+            normal = -normal
+
+        # 5. EMA filter to stabilize the plane over time
+        if self.ema_normal is None:
+            self.ema_normal = normal
+            self.ema_centroid = centroid
+        else:
+            self.ema_normal = (
+                self.ema_alpha * normal + (1 - self.ema_alpha) * self.ema_normal
+            )
+            self.ema_normal /= np.linalg.norm(self.ema_normal)  # Re-normalize
+            self.ema_centroid = (
+                self.ema_alpha * centroid + (1 - self.ema_alpha) * self.ema_centroid
+            )
+
+        # 6. Build the 4x4 Householder affine matrix
+        n = self.ema_normal
+        c = self.ema_centroid
+
+        R = np.eye(3) - 2 * np.outer(n, n)
+        d = -np.dot(n, c)  # Distance from origin
+        t = -2 * d * n
+
+        reflection_matrix = np.eye(4)
+        reflection_matrix[:3, :3] = R
+        reflection_matrix[:3, 3] = t
+
+        # Keep legacy variables in sync if needed
+        self.normal_vector = self.ema_normal
+        self._reflection_matrix = reflection_matrix[:3, :3]
+        self.is_estimated = True
+
+        return reflection_matrix, n

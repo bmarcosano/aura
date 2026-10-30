@@ -1,87 +1,60 @@
 """
-Unit tests for the 3D Pose Reconstruction, Fusion, and EMA smoothing module.
+Tests for the exact metric 3D reconstruction module (StereoReconstructor).
+Replaces the old tests that checked the relative PoseReconstructor.
 """
 
 import numpy as np
+import pytest
 
-from aura.reconstruction import PoseReconstructor
-
-
-def test_single_view_fallback_and_anchoring():
-    reconstructor = PoseReconstructor(confidence_weight=0.5, alpha=1.0)  # No EMA
-    front = np.zeros((33, 3))
-
-    # Mock feet positions to test spatial grounding
-    front[27:33, 1] = 10.0  # Floor Y at 10.0
-    front[27, 0] = -2.0  # Left ankle X
-    front[28, 0] = 2.0  # Right ankle X (Midpoint X = 0.0)
-    front[27, 2] = 5.0  # Left ankle Z
-    front[28, 2] = 5.0  # Right ankle Z (Midpoint Z = 5.0)
-
-    fused = reconstructor.fuse_landmarks(front, None)
-
-    assert fused is not None
-    assert fused.shape == (33, 3)
-    # Check Grounding Math
-    assert np.max(fused[27:33, 1]) == 0.0  # Floor should be shifted to Y=0
-    assert (fused[27, 0] + fused[28, 0]) / 2.0 == 0.0  # X should be centered
-    assert (fused[27, 2] + fused[28, 2]) / 2.0 == 0.0  # Z should be centered
+from aura.reconstruction import StereoReconstructor
 
 
-def test_fusion_weighted_average():
-    reconstructor = PoseReconstructor(confidence_weight=0.5, alpha=1.0)
-    front = np.zeros((33, 3))
-    mirror = np.ones((33, 3)) * 10.0
-
-    # 50/50 fusion should result in raw coords being 5.0 everywhere
-    fused = reconstructor.fuse_landmarks(
-        front, mirror, is_anthropometrically_valid=True
+@pytest.fixture
+def dummy_camera_matrix():
+    """Mock intrinsic camera matrix for a 1920x1080 camera."""
+    return np.array(
+        [[1000.0, 0.0, 960.0], [0.0, 1000.0, 540.0], [0.0, 0.0, 1.0]], dtype=np.float32
     )
 
-    # After grounding, the floor Y (which was 5.0) becomes 0.0.
-    # Therefore, the Y coords of non-feet points (which were also 5.0) become 0.0.
-    assert np.allclose(np.max(fused[27:33, 1]), 0.0)
+
+@pytest.fixture
+def dummy_reflection_matrix():
+    """Mock affine reflection matrix (mirror placed in front of the camera)."""
+    # Simple reflection across a plane parallel to the camera sensor
+    M = np.eye(4, dtype=np.float32)
+    M[2, 2] = -1.0  # Invert Z-axis
+    M[2, 3] = 4.0  # Translation offset
+    return M
 
 
-def test_invalid_isometry_fallback():
-    reconstructor = PoseReconstructor(confidence_weight=0.5, alpha=1.0)
-    front = np.zeros((33, 3))
-    mirror = np.ones((33, 3)) * 100.0  # Wild hallucinated values
+def test_stereo_reconstructor_init(dummy_camera_matrix):
+    """Test initialization and projection matrix P1 construction."""
+    reconstructor = StereoReconstructor(dummy_camera_matrix)
 
-    # Should ignore mirror completely if invalid
-    fused = reconstructor.fuse_landmarks(
-        front, mirror, is_anthropometrically_valid=False
+    assert reconstructor.camera_matrix is not None
+    assert reconstructor.P1.shape == (3, 4)
+    # The left 3x3 block of P1 should be equal to the camera matrix
+    np.testing.assert_array_equal(reconstructor.P1[:, :3], dummy_camera_matrix)
+
+
+def test_triangulate_landmarks(dummy_camera_matrix, dummy_reflection_matrix):
+    """Test the triangulation logic with mock 2D pixel data."""
+    reconstructor = StereoReconstructor(dummy_camera_matrix)
+
+    num_landmarks = 33
+
+    # Generate mock 2D pixel coordinates for direct and reflected views
+    points_2d_direct = np.random.rand(num_landmarks, 2).astype(np.float32) * 1000
+    points_2d_reflected = np.random.rand(num_landmarks, 2).astype(np.float32) * 1000
+
+    # Execute triangulation
+    landmarks_3d = reconstructor.triangulate_landmarks(
+        points_2d_direct, points_2d_reflected, dummy_reflection_matrix
     )
 
-    assert (
-        np.max(fused[27:33, 1]) == 0.0
-    )  # Grounded front (0.0), not influenced by mirror (100.0)
-
-
-def test_ema_smoothing():
-    reconstructor = PoseReconstructor(confidence_weight=0.5, alpha=0.5)
-
-    # Frame 1
-    front1 = np.zeros((33, 3))
-    fused1 = reconstructor.fuse_landmarks(front1, None)
-
-    assert reconstructor._previous_fused is not None
-    assert np.array_equal(reconstructor._previous_fused, fused1)
-
-    # Frame 2
-    front2 = np.zeros((33, 3))
-    # Mock a change in the front view to test EMA smoothing
-    front2[0:25] = 10.0
-    fused2 = reconstructor.fuse_landmarks(front2, None)
-
-    # Since alpha=0.5, the raw new grounded frame and the old frame are averaged
-    assert not np.array_equal(fused1, fused2)
-
-    # Reset
-    reconstructor.reset_smoothing()
-    assert reconstructor._previous_fused is None
-
-
-def test_none_inputs():
-    reconstructor = PoseReconstructor()
-    assert reconstructor.fuse_landmarks(None, None) is None
+    # Verify the output shape and type
+    assert landmarks_3d.shape == (num_landmarks, 3)
+    assert not np.isnan(landmarks_3d).any(), "Triangulated points contain NaN values"
+    assert not np.isinf(landmarks_3d).any(), (
+        "Triangulated points contain Infinite values"
+    )

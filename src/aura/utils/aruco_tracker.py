@@ -21,7 +21,7 @@ class ArucoMultiTracker:
         """
         Args:
             dict_type: The ArUco dictionary to use (default: 4x4 squares, up to 50 IDs).
-            marker_size_m: The physical size of the printed marker side in meters (default: 5 cm).
+            marker_size_m: The physical size of the printed marker side in meters (default: 18 cm).
         """
         self.marker_size = marker_size_m
 
@@ -92,3 +92,53 @@ class ArucoMultiTracker:
                     )
 
         return frame, poses
+
+    def estimate_mirror_plane(
+        self, rvec: np.ndarray, tvec: np.ndarray
+    ) -> dict[str, np.ndarray | float]:
+        """
+        Calculates the exact mirror plane equation (n*P + d = 0) and the full 4x4
+        affine reflection matrix using the ArUco marker pose.
+
+        Args:
+            rvec: Rotation vector from cv2.solvePnP (shape: 3x1 or 1x3).
+            tvec: Translation vector from cv2.solvePnP (shape: 3x1 or 1x3).
+
+        Returns:
+            A dictionary containing the normal vector, point on plane, d, and reflection_matrix.
+        """
+        # 1. Convert the rotation vector to a 3x3 rotation matrix
+        R, _ = cv2.Rodrigues(rvec)
+
+        # 2. The normal vector of the mirror is the Z-axis of the ArUco marker
+        # transformed into the camera coordinate system (3rd column of R).
+        normal = R[:, 2]
+
+        # Ensure the normal is a strictly normalized unit vector
+        normal = normal / np.linalg.norm(normal)
+
+        # 3. The translation vector (tvec) represents a physical 3D point on the mirror plane
+        point_on_plane = tvec.reshape(3)
+
+        # 4. Calculate the scalar distance 'd' for the plane equation: n_x*X + n_y*Y + n_z*Z + d = 0
+        # Therefore, d = - dot(normal, point_on_plane)
+        d = -np.dot(normal, point_on_plane)
+
+        # 5. Construct the 4x4 Affine Reflection Matrix (Householder transformation)
+        # M_ref = [ I - 2*n*n^T   |  -2*d*n ]
+        #         [       0       |     1   ]
+        M_ref = np.eye(4, dtype=np.float32)
+        n = normal.reshape(3, 1)
+
+        # Rotational part (3x3)
+        M_ref[:3, :3] = np.eye(3) - 2 * (n @ n.T)
+
+        # Translational part (3x1)
+        M_ref[:3, 3] = -2 * d * normal
+
+        return {
+            "normal": normal,
+            "point_on_plane": point_on_plane,
+            "d": float(d),
+            "reflection_matrix": M_ref,
+        }
