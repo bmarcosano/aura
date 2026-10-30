@@ -1,304 +1,230 @@
-"""
-Module for Temporal Biomechanical Analysis using Multidimensional Dynamic Time Warping (DTW).
-
-This module analyzes movement execution over time by extracting 3D joint angles
-from reconstructed skeletal landmarks and comparing the live sequence against a pre-recorded
-"Golden Standard" (e.g., a trainer). It supports JSON persistence for multi-feature trajectories.
-"""
+"""Multidimensional DTW comparison and versioned Golden Standard persistence."""
 
 from __future__ import annotations
 
 import json
-import os
+import typing
+from pathlib import Path
 
 import numpy as np
-from scipy.spatial.distance import cdist
+
+from aura.geometry import calculate_angle
 
 
 class DTWTemporalAnalyzer:
+    """Compare exercise feature trajectories with a trainer-recorded reference.
+
+    The legacy method signatures and the ``golden_reference`` JSON key are
+    preserved. Scalar legacy references can be loaded, but are never silently
+    compared with a multidimensional feature sequence.
     """
-    Analyzes temporal execution of movement using multidimensional 3D kinematic feature vectors
-    (e.g., knee and elbow angles) and Dynamic Time Warping (DTW).
-    """
+
+    DEFAULT_FEATURES: typing.ClassVar[list[str]] = [
+        "left_knee",
+        "right_knee",
+        "left_elbow",
+        "right_elbow",
+    ]
 
     def __init__(self, sensitivity: float = 5.0) -> None:
-        """
-        Initializes the Temporal Analyzer.
-
-        Args:
-            sensitivity: Scale factor for scoring penalty as DTW distance increases.
-        """
-        self.golden_reference: list = []  # Time x Features or Time x 1
-        self.user_buffer: list = []  # Time x Features or Time x 1
-        self.sensitivity = sensitivity
+        if sensitivity <= 0:
+            raise ValueError("sensitivity must be positive")
+        self.golden_reference: list = []
+        self.user_buffer: list = []
+        self.sensitivity = float(sensitivity)
+        self.feature_names = list(self.DEFAULT_FEATURES)
+        self.schema_version = 2
+        # Optional provenance prevents mixing incompatible reference/user pipelines.
+        self.reference_metadata: dict = {}
 
     def _compute_angle_3d(self, a: np.ndarray, b: np.ndarray, c: np.ndarray) -> float:
-        """
-        Computes the 3D angle (in degrees) between three 3D points (a, b, c) with b as the vertex.
-        """
-        ba = a - b
-        bc = c - b
-
-        norm_ba = np.linalg.norm(ba)
-        norm_bc = np.linalg.norm(bc)
-
-        if norm_ba < 1e-6 or norm_bc < 1e-6:
-            return 0.0
-
-        cosine_angle = np.dot(ba, bc) / (norm_ba * norm_bc)
-        cosine_angle = np.clip(cosine_angle, -1.0, 1.0)
-
-        return float(np.degrees(np.arccos(cosine_angle)))
+        """Compute a 3D joint angle; NaN marks missing/degenerate observations."""
+        return calculate_angle(a, b, c)
 
     def extract_kinematic_features(self, landmarks_3d: np.ndarray) -> np.ndarray:
-        """
-        Extracts key biomechanical joint angles (knee & elbow 3D angles) from a 3D skeleton.
-        Returns a 4-dimensional feature vector.
-        """
-        try:
-            left_knee = self._compute_angle_3d(
-                landmarks_3d[23], landmarks_3d[25], landmarks_3d[27]
-            )
-            right_knee = self._compute_angle_3d(
-                landmarks_3d[24], landmarks_3d[26], landmarks_3d[28]
-            )
-            left_elbow = self._compute_angle_3d(
-                landmarks_3d[11], landmarks_3d[13], landmarks_3d[15]
-            )
-            right_elbow = self._compute_angle_3d(
-                landmarks_3d[12], landmarks_3d[14], landmarks_3d[16]
-            )
+        """Extract left/right knee and elbow angles from 33 3D landmarks."""
+        points = np.asarray(landmarks_3d, dtype=np.float64)
+        if points.shape != (33, 3):
+            return np.full(4, np.nan, dtype=np.float32)
+        values = [
+            self._compute_angle_3d(points[23], points[25], points[27]),
+            self._compute_angle_3d(points[24], points[26], points[28]),
+            self._compute_angle_3d(points[11], points[13], points[15]),
+            self._compute_angle_3d(points[12], points[14], points[16]),
+        ]
+        return np.asarray(values, dtype=np.float32)
 
-            return np.array(
-                [left_knee, right_knee, left_elbow, right_elbow], dtype=np.float32
-            )
-        except (IndexError, TypeError):
-            return np.zeros(4, dtype=np.float32)
+    @staticmethod
+    def _as_trajectory(trajectory: list | np.ndarray) -> np.ndarray:
+        array = np.asarray(trajectory, dtype=np.float32)
+        if array.ndim == 1:
+            array = array.reshape(-1, 1)  # Preserve one-feature legacy recordings.
+        if array.ndim != 2 or array.shape[0] == 0 or array.shape[1] == 0:
+            raise ValueError("Trajectory must be a non-empty 1D or 2D array")
+        if not np.isfinite(array).all():
+            raise ValueError("Trajectory contains non-finite feature values")
+        return array
 
     def load_golden_standard(self, trajectory: list | np.ndarray) -> None:
-        """Loads the ideal movement execution feature matrix directly from memory."""
-        if trajectory is None or len(trajectory) == 0:
-            raise ValueError("Golden standard trajectory cannot be empty.")
-
-        if isinstance(trajectory, np.ndarray):
-            self.golden_reference = trajectory.tolist()
-        else:
-            self.golden_reference = list(trajectory)
-
-        print(
-            f"✅ Golden Standard loaded in memory ({len(self.golden_reference)} frames)."
-        )
-
-    # ==========================================
-    # DATA PERSISTENCE & FILE MANAGEMENT
-    # ==========================================
+        """Load a 1D legacy or 2D feature trajectory into memory."""
+        array = self._as_trajectory(trajectory)
+        self.golden_reference = array.tolist()
+        self.reference_metadata = {}
 
     def save_golden_standard(
         self, exercise: str = "squats", filename: str = "golden.json"
     ) -> bool:
-        """
-        Saves the currently recorded Golden Standard to a structured exercise directory.
-        """
+        """Save the Golden Standard in a versioned JSON envelope."""
         if not self.golden_reference:
-            print("⚠️ Error: No Golden Standard in memory to save.")
             return False
-
-        dir_path = os.path.join("golden_executions", exercise)
-        os.makedirs(dir_path, exist_ok=True)
-        filepath = os.path.join(dir_path, filename)
-
+        path = Path("golden_executions") / exercise / filename
         try:
-            with open(filepath, "w") as f:
-                json.dump({"golden_reference": self.golden_reference}, f, indent=4)
-            print(
-                f"💾 Saved successfully: {filepath} ({len(self.golden_reference)} frames)"
-            )
+            path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "schema_version": self.schema_version,
+                "exercise": exercise,
+                "feature_names": self.feature_names,
+                "coordinate_units": "degrees",
+                "metadata": self.reference_metadata,
+                "golden_reference": self.golden_reference,
+            }
+            path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
             return True
-        except (OSError, TypeError) as e:
-            print(f"❌ Error saving to file: {e}")
+        except (OSError, TypeError, ValueError):
             return False
 
     def load_golden_standard_from_file(
         self, exercise: str = "squats", filename: str = "golden.json"
     ) -> bool:
-        """
-        Loads a previously saved Golden Standard from golden_executions/<exercise>/<filename>.
-        Includes backward compatibility checks to prevent crashes with legacy 1D (scalar) recordings.
-        """
-        filepath = os.path.join("golden_executions", exercise, filename)
-
-        if not os.path.exists(filepath):
-            print(f"⚠️ Error: File '{filepath}' not found on disk.")
+        """Load current or legacy Golden Standard JSON without dimension guessing."""
+        path = Path("golden_executions") / exercise / filename
+        if not path.is_file():
             return False
-
         try:
-            with open(filepath, "r") as f:
-                data = json.load(f)
-
-            if "golden_reference" in data:
-                ref_data = np.array(data["golden_reference"])
-
-                # CRITICAL FIX: Block legacy 1D scalar recordings from crashing scipy.cdist
-                if ref_data.ndim == 1:
-                    print(
-                        "⚠️ WARNING: Found legacy Golden Standard (scalar). Incompatible with new 4-angle vectors."
-                    )
-                    self.golden_reference = []
-                    return False
-
-                self.golden_reference = ref_data.tolist()
-                print(
-                    f"📂 Loaded successfully: {filepath} ({len(self.golden_reference)} frames)."
-                )
-                return True
-            else:
-                print(f"⚠️ Error: '{filepath}' is missing 'golden_reference' data.")
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            reference = self._as_trajectory(payload["golden_reference"])
+            names = payload.get("feature_names")
+            if names is not None and len(names) != reference.shape[1]:
                 return False
-        except (OSError, json.JSONDecodeError, KeyError) as e:
-            print(f"❌ Error reading file: {e}")
+            self.golden_reference = reference.tolist()
+            if names:
+                self.feature_names = list(names)
+            elif reference.shape[1] == 1:
+                self.feature_names = ["legacy_scalar"]
+            self.reference_metadata = dict(payload.get("metadata", {}))
+            return True
+        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
             return False
 
     def delete_golden_standard_file(
         self, exercise: str = "squats", filename: str = "golden.json"
     ) -> bool:
-        """Deletes the specific exercise Golden Standard file from disk."""
-        filepath = os.path.join("golden_executions", exercise, filename)
-
-        if os.path.exists(filepath):
-            try:
-                os.remove(filepath)
-                print(f"🗑️ File deleted successfully: {filepath}")
-                return True
-            except OSError as e:
-                print(f"❌ Error deleting file: {e}")
+        """Delete a saved Golden Standard file."""
+        path = Path("golden_executions") / exercise / filename
+        try:
+            if not path.is_file():
                 return False
-        else:
-            print(f"⚠️ File '{filepath}' does not exist on disk.")
+            path.unlink()
+            return True
+        except OSError:
             return False
 
-    # ==========================================
-    # USER BUFFER & EVALUATION
-    # ==========================================
-
     def add_user_frame(self, frame_features: np.ndarray | list[float] | float) -> None:
-        """
-        Appends a real-time biomechanical feature vector (or scalar) to the user buffer.
-        """
-        if isinstance(frame_features, np.ndarray):
-            self.user_buffer.append(frame_features.tolist())
-        elif isinstance(frame_features, (list, tuple)):
-            self.user_buffer.append(list(frame_features))
-        else:
-            self.user_buffer.append(float(frame_features))
+        """Append one finite feature vector; skip invalid frames instead of storing zeros."""
+        values = np.asarray(frame_features, dtype=np.float32).reshape(-1)
+        if values.size and np.isfinite(values).all():
+            self.user_buffer.append(values.tolist())
 
     def reset_user_buffer(self) -> None:
-        """Clears the user buffer to prepare for the next repetition."""
+        """Clear current user sequence."""
         self.user_buffer.clear()
 
     def check_live_pacing(self) -> str:
-        """
-        Performs a lightweight real-time pace check by comparing
-        the user's current progress against the loaded Golden Standard length.
-        """
+        """Return a coarse duration-based pacing hint, not a technique score."""
         if not self.golden_reference or not self.user_buffer:
             return "PACE: IDLE"
-
-        ref_len = len(self.golden_reference)
-        user_len = len(self.user_buffer)
-        ratio = user_len / ref_len
-
+        ratio = len(self.user_buffer) / max(1, len(self.golden_reference))
         if ratio > 1.25:
-            return "PACE: TOO SLOW (Speed up to match the trainer)"
-        elif ratio < 0.75 and user_len > 10:
-            return "PACE: TOO FAST (Slow down to match the trainer)"
-        else:
-            return "PACE: OPTIMAL"
+            return "PACE: TOO SLOW"
+        if ratio < 0.75 and len(self.user_buffer) > 10:
+            return "PACE: TOO FAST"
+        return "PACE: OPTIMAL"
+
+    @staticmethod
+    def _dtw_distance(
+        sequence_a: np.ndarray, sequence_b: np.ndarray
+    ) -> tuple[float, int]:
+        """Compute exact DTW using Euclidean frame cost and return path length."""
+        n, m = len(sequence_a), len(sequence_b)
+        cost = np.full((n + 1, m + 1), np.inf, dtype=np.float64)
+        length = np.zeros((n + 1, m + 1), dtype=np.int32)
+        cost[0, 0] = 0.0
+        for i in range(1, n + 1):
+            for j in range(1, m + 1):
+                local = float(np.linalg.norm(sequence_a[i - 1] - sequence_b[j - 1]))
+                options = (cost[i - 1, j - 1], cost[i - 1, j], cost[i, j - 1])
+                move = int(np.argmin(options))
+                if move == 0:
+                    pi, pj = i - 1, j - 1
+                elif move == 1:
+                    pi, pj = i - 1, j
+                else:
+                    pi, pj = i, j - 1
+                cost[i, j] = local + options[move]
+                length[i, j] = length[pi, pj] + 1
+        return float(cost[n, m]), int(length[n, m])
 
     def evaluate_technique(self) -> dict:
-        """
-        Warp-aligns the user's feature buffer against the Golden Standard using
-        multidimensional Dynamic Time Warping (DTW).
-
-        Returns:
-            Dictionary containing evaluation status, score, raw distance, and feedback.
-        """
+        """Align feature sequences and return a transparent algorithmic score."""
         if not self.golden_reference:
             return {
                 "error": "No Golden Standard loaded.",
-                "score": 0,
+                "score": 0.0,
                 "raw_distance": 0.0,
+                "status": "NO_REFERENCE",
             }
-
         if len(self.user_buffer) < 5:
             return {
                 "error": "User movement too short for analysis.",
-                "score": 0,
+                "score": 0.0,
                 "raw_distance": 0.0,
+                "status": "TOO_SHORT",
             }
-
-        seq1 = np.asarray(self.user_buffer, dtype=np.float32)
-        seq2 = np.asarray(self.golden_reference, dtype=np.float32)
-
-        if seq1.ndim == 1:
-            seq1 = seq1.reshape(-1, 1)
-        if seq2.ndim == 1:
-            seq2 = seq2.reshape(-1, 1)
-
-        dist_matrix = cdist(seq1, seq2, metric="euclidean")
-
-        T, K = dist_matrix.shape
-        cost_matrix = np.full((T + 1, K + 1), float("inf"))
-        cost_matrix[0, 0] = 0.0
-
-        for i in range(1, T + 1):
-            for j in range(1, K + 1):
-                cost = dist_matrix[i - 1, j - 1]
-                cost_matrix[i, j] = cost + min(
-                    cost_matrix[i - 1, j],  # insertion
-                    cost_matrix[i, j - 1],  # deletion
-                    cost_matrix[i - 1, j - 1],  # match
-                )
-
-        raw_distance = cost_matrix[T, K]
-
-        # Backtrack optimal warping path to find exact path length
-        i, j = T, K
-        path_len = 0
-        while i > 0 and j > 0:
-            path_len += 1
-            c_match = cost_matrix[i - 1, j - 1]
-            c_ins = cost_matrix[i - 1, j]
-            c_del = cost_matrix[i, j - 1]
-            m = min(c_match, c_ins, c_del)
-            if m == c_match:
-                i -= 1
-                j -= 1
-            elif m == c_ins:
-                i -= 1
-            else:
-                j -= 1
-        path_len += i + j
-
-        avg_deviation = raw_distance / max(1, path_len)
-
-        raw_score = 100.0 - (avg_deviation * self.sensitivity)
-        final_score = max(0.0, min(100.0, raw_score))
-
-        if final_score >= 90:
-            feedback = "EXCELLENT"
-        elif final_score >= 75:
-            feedback = "GOOD"
-        elif final_score >= 50:
-            feedback = "FAIR - Form breaking down"
-        else:
-            feedback = "POOR - Biomechanical risk"
-
-        # CRITICAL FIX: raw_distance added to return dict to prevent Engine errors
+        try:
+            user = self._as_trajectory(self.user_buffer)
+            golden = self._as_trajectory(self.golden_reference)
+        except ValueError as exc:
+            return {
+                "error": str(exc),
+                "score": 0.0,
+                "raw_distance": float("inf"),
+                "status": "INVALID_DATA",
+            }
+        if user.shape[1] != golden.shape[1]:
+            return {
+                "error": f"Feature mismatch: user has {user.shape[1]}, reference has {golden.shape[1]}.",
+                "score": 0.0,
+                "raw_distance": float("inf"),
+                "status": "INCOMPATIBLE_REFERENCE",
+            }
+        raw, path_length = self._dtw_distance(user, golden)
+        average = raw / max(1, path_length)
+        score = float(np.clip(100.0 - self.sensitivity * average, 0.0, 100.0))
+        feedback = (
+            "EXCELLENT"
+            if score >= 90
+            else "GOOD"
+            if score >= 75
+            else "FAIR - Review movement form"
+            if score >= 50
+            else "DEVIATION - Trainer review recommended"
+        )
         return {
             "status": "SUCCESS",
-            "score": round(float(final_score), 1),
-            "raw_distance": float(raw_distance),
-            "deviation_per_frame": round(float(avg_deviation), 3),
+            "score": round(score, 1),
+            "raw_distance": raw,
+            "deviation_per_frame": round(average, 3),
             "feedback": feedback,
-            "frames_analyzed": len(self.user_buffer),
+            "frames_analyzed": len(user),
+            "feature_count": user.shape[1],
         }

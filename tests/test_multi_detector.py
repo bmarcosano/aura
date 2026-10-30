@@ -39,14 +39,18 @@ def test_process_frame_basic(monkeypatch):
     """Test dual-view detection pipeline coordinates splitting, flipping, and detector calls."""
     # Arrange
     detector = MultiSkeletonDetector(split_ratio=0.5)
-    dummy_frame = np.zeros((480, 640, 3), dtype=np.uint8)
-
-    # Mock detect methods to isolate multi-detector logic
-    mock_detect_front = MagicMock()
-    mock_detect_mirror = MagicMock()
+    dummy_raw = np.zeros((33, 4), dtype=np.float32)
+    mock_detect_front = MagicMock(return_value=dummy_raw)
+    mock_detect_mirror = MagicMock(return_value=dummy_raw)
     monkeypatch.setattr(detector.front_detector, "detect", mock_detect_front)
     monkeypatch.setattr(detector.mirror_detector, "detect", mock_detect_mirror)
-
+    dummy_2d = np.zeros((33, 2), dtype=np.float32)
+    monkeypatch.setattr(
+        detector.front_detector, "get_landmark_array", MagicMock(return_value=dummy_2d)
+    )
+    monkeypatch.setattr(
+        detector.mirror_detector, "get_landmark_array", MagicMock(return_value=dummy_2d)
+    )
     # Mock world landmarks to bypass SVD/validation logic for this basic routing test
     monkeypatch.setattr(
         detector.front_detector,
@@ -58,6 +62,7 @@ def test_process_frame_basic(monkeypatch):
         "get_world_landmark_array",
         MagicMock(return_value=None),
     )
+    dummy_frame = np.zeros((480, 640, 3), dtype=np.uint8)
 
     # Act
     result = detector.process_frame(dummy_frame)

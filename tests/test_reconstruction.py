@@ -1,59 +1,68 @@
-"""
-Tests for the exact metric 3D reconstruction module (StereoReconstructor).
-Replaces the old tests that checked the relative PoseReconstructor.
-"""
-
 import numpy as np
-import pytest
 
 from aura.reconstruction import StereoReconstructor
 
 
-@pytest.fixture
-def dummy_camera_matrix():
-    """Mock intrinsic camera matrix for a 1920x1080 camera."""
-    return np.array(
-        [[1000.0, 0.0, 960.0], [0.0, 1000.0, 540.0], [0.0, 0.0, 1.0]], dtype=np.float32
+def project(K, points):
+    projected = (K @ points.T).T
+    return projected[:, :2] / projected[:, 2:3]
+
+
+def test_triangulation_recovers_synthetic_points():
+    K = np.array([[900.0, 0.0, 640.0], [0.0, 900.0, 360.0], [0.0, 0.0, 1.0]])
+    reconstructor = StereoReconstructor(K)
+    # Plane z=2m: reflected camera mapping is z' = 4-z.
+    transform = np.eye(4)
+    transform[2, 2] = -1.0
+    transform[2, 3] = 4.0
+    points = np.array(
+        [
+            [-0.35, -0.20, 0.80],
+            [0.20, 0.10, 1.00],
+            [0.45, -0.15, 1.25],
+            [-0.10, 0.25, 1.45],
+            [0.15, 0.32, 1.60],
+        ]
     )
-
-
-@pytest.fixture
-def dummy_reflection_matrix():
-    """Mock affine reflection matrix (mirror placed in front of the camera)."""
-    M = np.eye(4, dtype=np.float32)
-    M[2, 2] = -1.0  # Invert Z-axis
-    M[2, 3] = 4.0  # Translation offset
-    return M
-
-
-def test_stereo_reconstructor_init(dummy_camera_matrix):
-    """Test initialization and projection matrix P1 construction."""
-    reconstructor = StereoReconstructor(dummy_camera_matrix)
-
-    assert reconstructor.camera_matrix is not None
-    assert reconstructor.P1.shape == (3, 4)
-    np.testing.assert_array_equal(reconstructor.P1[:, :3], dummy_camera_matrix)
-
-
-def test_triangulate_landmarks(dummy_camera_matrix, dummy_reflection_matrix):
-    """Test the triangulation logic with mock 2D pixel data and validity mask."""
-    reconstructor = StereoReconstructor(dummy_camera_matrix)
-
-    num_landmarks = 33
-
-    # Generate mock 2D pixel coordinates for direct and reflected views
-    points_2d_direct = np.random.rand(num_landmarks, 2).astype(np.float32) * 1000
-    points_2d_reflected = np.random.rand(num_landmarks, 2).astype(np.float32) * 1000
-
-    # Execute triangulation (unpacking points_3d and validity_mask tuple)
-    landmarks_3d, validity_mask = reconstructor.triangulate_landmarks(
-        points_2d_direct, points_2d_reflected, dummy_reflection_matrix
+    direct = project(K, points)
+    virtual_points = (transform @ np.c_[points, np.ones(len(points))].T).T[:, :3]
+    reflected = project(K, virtual_points)
+    recovered = reconstructor.triangulate_landmarks(
+        direct, reflected, transform, max_error_px=1.0
     )
+    assert reconstructor.last_valid_mask.all()
+    assert np.allclose(recovered, points, atol=1e-5)
 
-    # Verify the output shapes and types
-    assert landmarks_3d.shape == (num_landmarks, 3)
-    assert validity_mask.shape == (num_landmarks,)
-    assert not np.isnan(landmarks_3d).any(), "Triangulated points contain NaN values"
-    assert not np.isinf(landmarks_3d).any(), (
-        "Triangulated points contain Infinite values"
+
+def test_reprojection_outlier_is_rejected():
+    K = np.array([[800.0, 0.0, 320.0], [0.0, 800.0, 240.0], [0.0, 0.0, 1.0]])
+    reconstructor = StereoReconstructor(K)
+    transform = np.eye(4)
+    transform[2, 2], transform[2, 3] = -1.0, 4.0
+    points = np.array([[0.1, 0.0, 0.8], [-0.2, 0.1, 1.2]])
+    direct = project(K, points)
+    reflected_points = (transform @ np.c_[points, np.ones(2)].T).T[:, :3]
+    reflected = project(K, reflected_points)
+    reflected[1, 0] += 150.0
+    recovered = reconstructor.triangulate_landmarks(
+        direct, reflected, transform, max_error_px=3.0
     )
+    assert reconstructor.last_valid_mask.tolist() == [True, False]
+    assert np.isfinite(recovered[0]).all()
+    assert np.isnan(recovered[1]).all()
+
+
+def test_legacy_fusion_returns_array():
+    reconstructor = StereoReconstructor(np.eye(3))
+    front = np.ones((33, 3), dtype=float)
+    result = reconstructor.fuse_landmarks(front)
+    assert result.shape == (33, 3)
+    assert np.allclose(result, front)
+
+
+def test_invalid_nonreflection_matrix_is_rejected():
+    reconstructor = StereoReconstructor(np.eye(3))
+    with np.testing.assert_raises(ValueError):
+        reconstructor.triangulate_landmarks(
+            np.array([[1.0, 1.0]]), np.array([[2.0, 2.0]]), np.eye(4)
+        )

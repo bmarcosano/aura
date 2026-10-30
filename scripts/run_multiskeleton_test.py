@@ -1,108 +1,83 @@
-"""Script to test the MultiSkeletonDetector pipeline with Auto Calibration."""
+"""Exercise the real MultiSkeletonDetector ROI-to-full-frame coordinate path."""
 
 from __future__ import annotations
 
-import argparse
+# Support direct execution from a source checkout before editable installation.
 import sys
+from pathlib import Path
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_SRC_DIR = _REPO_ROOT / "src"
+if _SRC_DIR.is_dir() and str(_SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(_SRC_DIR))
+
+import argparse
 
 import cv2
 
-from aura.detector import PoseDetector
 from aura.multi_detector import MultiSkeletonDetector
-from aura.roi_splitter import AutoROISplitter
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Test MultiSkeletonDetector with Auto splitting on a video or webcam."
+        description="Test AURA direct/mirror ROI pose detection"
     )
-    parser.add_argument(
-        "--source",
-        type=str,
-        default="0",
-        help="Video source: path to a video file or webcam index (default: '0' for webcam)",
-    )
+    parser.add_argument("--source", default="0")
+    parser.add_argument("--split", type=float, default=0.5)
     args = parser.parse_args()
-
-    # Parse source: if it's a digit, treat it as a webcam index, otherwise as a file path
-    source: int | str = int(args.source) if args.source.isdigit() else args.source
+    source = int(args.source) if str(args.source).isdigit() else args.source
     cap = cv2.VideoCapture(source)
-
     if not cap.isOpened():
-        print(f"❌ Error: Could not open video source '{source}'")
-        sys.exit(1)
-
-    # Retrieve video FPS to synchronize playback speed
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    delay = int(1000 / fps) if fps > 0 else 33
-
-    # Initialize the auto-splitter and pose detectors
-    splitter = AutoROISplitter()
-    front_pose_detector = PoseDetector()
-    mirror_pose_detector = PoseDetector()
-
-    # This will remain None until auto-splitting is successfully completed
-    multi_detector: MultiSkeletonDetector | None = None
-
-    print(
-        f"🚀 Starting test using source: {source} (FPS: {fps if fps > 0 else 'N/A'})."
-    )
-    print(
-        "⏳ AUTO-SPLITTING PHASE: Analysing motion to find the optimal mirror split line..."
-    )
-    print("Press 'q' at any time to exit.")
-
-    while cap.isOpened():
-        success, frame = cap.read()
-
-        if not success or frame is None or frame.size == 0:
-            print("End of video stream or empty frame received.")
-            break
-
-        # --- PHASE 1: AUTO-SPLITTING ---
-        if multi_detector is None:
-            split_ratio = splitter.update(frame)
-
-            if split_ratio is not None:
-                print(
-                    f"\n✅ Auto-splitting complete! Optimal split ratio locked at: {split_ratio:.3f}"
-                )
-                multi_detector = MultiSkeletonDetector(split_ratio=split_ratio)
-                cv2.destroyWindow("AURA - Auto-Splitting")
-            else:
-                cv2.imshow("AURA - Auto-Splitting", frame)
-
-        # --- PHASE 2: DETECTION AND ROI CROPPING ---
-        else:
-            front_roi, mirror_roi = multi_detector._crop_rois(frame)
-
-            # Execute pose detection only if both ROIs are valid and non-empty
+        raise ValueError(f"Could not open source: {source}")
+    detector = MultiSkeletonDetector(split_ratio=args.split)
+    try:
+        while True:
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                break
+            data = detector.process_frame(frame)
+            front = data["front_roi"].copy()
+            mirror = data["mirror_roi"].copy()
+            cv2.putText(
+                front,
+                f"Direct valid: {data['direct_pose_2d'] is not None}",
+                (10, 25),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (0, 255, 0),
+                1,
+            )
+            cv2.putText(
+                mirror,
+                f"Mirror valid: {data['reflected_pose_2d'] is not None}",
+                (10, 25),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (0, 255, 0),
+                1,
+            )
+            cv2.imshow("AURA - Direct ROI", front)
+            cv2.imshow("AURA - Mirror ROI", mirror)
+            # Debug output coordinates are expected in full-frame pixel coordinates.
             if (
-                front_roi.size > 0
-                and mirror_roi.size > 0
-                and front_roi.shape[0] > 0
-                and mirror_roi.shape[1] > 0
+                data["direct_pose_2d"] is not None
+                and data["reflected_pose_2d"] is not None
             ):
-                _ = front_pose_detector.detect(front_roi, draw=True)
-                _ = mirror_pose_detector.detect(mirror_roi, draw=True)
-
-                cv2.imshow("AURA - Front View", front_roi)
-                cv2.imshow("AURA - Mirror View (Flipped)", mirror_roi)
-            else:
-                # Print a warning if the ROIs are invalid, but continue processing subsequent frames
                 print(
-                    "⚠️ Warning: Invalid or empty ROIs detected. Skipping pose detection for this frame."
+                    "split_x=",
+                    data["split_x"],
+                    "direct[0]=",
+                    data["direct_pose_2d"][0],
+                    "mirror[0]=",
+                    data["reflected_pose_2d"][0],
                 )
-
-        # --- KEYBOARD LISTENER ---
-        # Key listener for quitting the application. Note: focus on one of the video windows before pressing 'q'.
-        if cv2.waitKey(delay) & 0xFF == ord("q"):
-            print("❌ Exit command received. Terminating the test.")
-            break
-
-    # Clean up resources properly
-    cap.release()
-    cv2.destroyAllWindows()
+            key = cv2.waitKey(1) & 0xFF
+            if key in (27, ord("q"), ord("Q")):
+                break
+    finally:
+        detector.close()
+        cap.release()
+        cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":

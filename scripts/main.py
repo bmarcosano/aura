@@ -1,42 +1,42 @@
-"""
-AURA - Main Entry Point (v4.0.0)
-"""
+"""Command-line entry point for the AURA magic-mirror application."""
+
+from __future__ import annotations
+
+# Support direct execution from a source checkout before editable installation.
+import sys
+from pathlib import Path
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_SRC_DIR = _REPO_ROOT / "src"
+if _SRC_DIR.is_dir() and str(_SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(_SRC_DIR))
 
 import argparse
-import sys
+import logging
 
 from aura.engine import AuraEngine
 
 
-def parse_arguments():
-    parser = argparse.ArgumentParser(description="AURA - Autonomous Pose Tracking")
+def parse_arguments() -> argparse.Namespace:
+    """Parse source and exercise selection without changing AuraEngine's API."""
+    parser = argparse.ArgumentParser(description="AURA real-time exercise coach")
+    parser.add_argument("--source", default="0", help="Camera index or video path")
+    parser.add_argument("--exercise", default="squats", help="Exercise profile name")
     parser.add_argument(
-        "--source",
-        type=str,
-        default="0",
-        help="Video source path or 0 for local webcam",
-    )
-    parser.add_argument(
-        "--exercise",
-        type=str,
-        default="squats",
-        help="Target exercise subfolder name (e.g., squats, push_up)",
+        "--log-level", default="INFO", choices=("DEBUG", "INFO", "WARNING", "ERROR")
     )
     return parser.parse_args()
 
 
-def main():
+def main() -> None:
     args = parse_arguments()
-
-    try:
-        # Initialize and run the AURA engine with the specified source and exercise
-        app = AuraEngine(source=args.source, exercise=args.exercise)
-        app.run()
-    except Exception as e:  # noqa: BLE001
-        print(f"❌ Critical System Failure: {e}")
-        sys.exit(1)
-    finally:
-        print("AURA shutdown complete.")
+    logging.basicConfig(
+        level=getattr(logging, args.log_level),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    source = int(args.source) if str(args.source).isdigit() else args.source
+    engine = AuraEngine(source=source, exercise=args.exercise)
+    engine.run()
 
 
 if __name__ == "__main__":

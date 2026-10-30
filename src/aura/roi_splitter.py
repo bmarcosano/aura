@@ -1,11 +1,4 @@
-"""
-Module for automatic 2D Region of Interest (ROI) split ratio estimation using motion detection.
-
-Once the kinematics layer confirms a mirror setup, this module estimates the exact vertical
-boundary (split ratio) separating the direct view of the user from the specular reflection.
-It utilizes a lightweight Mixture of Gaussians (MOG2) background subtractor to track the
-centroids of the two primary moving bodies and computes their spatial midpoint.
-"""
+"""Conservative motion-based proposal for a vertical direct/mirror ROI boundary."""
 
 from __future__ import annotations
 
@@ -14,120 +7,88 @@ import numpy as np
 
 
 class AutoROISplitter:
-    """
-    Estimates the vertical ROI split ratio by analyzing motion vectors in the frame.
+    """Estimate a split from two large moving blobs; never invent a timeout split.
 
-    Instead of running heavy deep-learning inference, it employs pixel-level motion analysis
-    to detect the two largest moving blobs (user and mirror reflection) and determines the
-    optical midpoint.
+    Motion centroids are only a proposal. They do not prove that the second blob
+    is a mirror reflection; the caller must still validate the two pose tracks
+    and mirror geometry before enabling metric reconstruction.
     """
 
     def __init__(self, required_frames: int = 5, timeout_frames: int = 60) -> None:
-        """
-        Initializes the ROI splitter.
-
-        Args:
-            required_frames (int): Number of consistent frame calculations required to finalize split.
-            timeout_frames (int): Fallback limit to force split estimation if motion stalls.
-        """
-        # MOG2 isolates moving foreground objects from the static background.
-        # learningRate=-1 allows automatic adaptation speed.
-        # detectShadows=False optimizes throughput and prevents shadow artifacts from skewing centroids.
+        if required_frames < 3 or timeout_frames < required_frames:
+            raise ValueError("Invalid splitter frame settings")
         self.bg_subtractor = cv2.createBackgroundSubtractorMOG2(detectShadows=False)
-
-        # Stores valid split ratio readings (0.0 to 1.0) to average out noise and outliers.
         self.split_ratios: list[float] = []
-
-        # Target number of valid frame readings before finalizing the split ratio
-        self.required_frames = required_frames
-
-        # Fallback limit: forces a split ratio if motion stalls or lighting is inadequate.
-        self.timeout_frames = timeout_frames
+        self.required_frames = int(required_frames)
+        self.timeout_frames = int(timeout_frames)
         self.frame_count = 0
+        self.timed_out = False
+        self.last_mad = float("inf")
 
     def update(self, frame: np.ndarray) -> float | None:
-        """
-        Processes an incoming video frame to detect motion and compute the ROI boundary.
-
-        Args:
-            frame (np.ndarray): Input BGR image from the camera feed.
-
-        Returns:
-            float | None: Averaged normalized split ratio (0.0 to 1.0) when complete,
-                          or None while accumulating data.
-        """
-        # --- 1. COMPLETION CHECK ---
+        """Return a stable split ratio or None while estimating/when timed out."""
+        if frame is None or frame.ndim != 3 or frame.size == 0:
+            return None
         if self.is_split_ready():
-            if cv2.getWindowProperty("AURA - Debug Mask", cv2.WND_PROP_VISIBLE) >= 1:
-                cv2.destroyWindow("AURA - Debug Mask")
-            return float(np.mean(self.split_ratios))
-
+            return float(np.median(self.split_ratios))
+        if self.timed_out:
+            return None
         self.frame_count += 1
-
-        # --- 2. TIMEOUT FALLBACK ---
         if self.frame_count > self.timeout_frames:
-            print("⚠️ ROI split timeout reached. Forcing split ratio.")
-            if cv2.getWindowProperty("AURA - Debug Mask", cv2.WND_PROP_VISIBLE) >= 1:
-                cv2.destroyWindow("AURA - Debug Mask")
-            return float(np.mean(self.split_ratios)) if self.split_ratios else 0.5
+            self.timed_out = True
+            return None
 
-        h, w = frame.shape[:2]
-
-        # --- 3. MOTION MASK GENERATION ---
-        # Generate binary mask: moving foreground = 255 (white), static background = 0 (black).
+        height, width = frame.shape[:2]
         mask = self.bg_subtractor.apply(frame, learningRate=-1)
-
-        # --- 4. NOISE REDUCTION & MORPHOLOGY ---
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-
-        # MORPH_OPEN removes high-frequency noise and pixel jitter.
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-
-        # MORPH_DILATE merges fragmented body contours into unified blobs.
-        mask = cv2.morphologyEx(mask, cv2.MORPH_DILATE, kernel, iterations=3)
-
-        # --- 5. CONTOUR EXTRACTION & FILTERING ---
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        minimum_area = width * height * 0.008
+        candidates = [c for c in contours if cv2.contourArea(c) >= minimum_area]
+        candidates.sort(key=cv2.contourArea, reverse=True)
+        if len(candidates) < 2:
+            return None
 
-        # Keep only contours exceeding 0.5% of total frame area
-        min_area = (w * h) * 0.005
-        large_contours = [c for c in contours if cv2.contourArea(c) > min_area]
-
-        # --- 6. GEOMETRIC MIDPOINT CALCULATION ---
-        if len(large_contours) >= 2:
-            # Select top 2 largest moving bodies (User + Reflection)
-            large_contours.sort(key=cv2.contourArea, reverse=True)
-            top_2_contours = large_contours[:2]
-
-            centers_x = []
-            for c in top_2_contours:
-                M = cv2.moments(c)
-                if M["m00"] > 0:
-                    # Centroid X-coordinate: M10 / M00
-                    centers_x.append(int(M["m10"] / M["m00"]))
-
-            if len(centers_x) == 2:
-                # Calculate optical boundary midpoint between user and reflection
-                midpoint_x = sum(centers_x) / 2.0
-                ratio = midpoint_x / w
-                self.split_ratios.append(ratio)
-
-                # --- 7. VISUAL FEEDBACK ---
+        centers = []
+        for contour in candidates[:2]:
+            moments = cv2.moments(contour)
+            if moments["m00"] <= 0:
+                return None
+            centers.append(moments["m10"] / moments["m00"])
+        left, right = sorted(centers)
+        separation = right - left
+        # Avoid accepting nearly coincident blobs or a split at the image edge.
+        if separation < 0.12 * width:
+            return None
+        ratio = (left + right) / (2.0 * width)
+        if not 0.15 <= ratio <= 0.85:
+            return None
+        self.split_ratios.append(float(ratio))
+        self.split_ratios = self.split_ratios[-max(self.required_frames * 3, 15) :]
+        if len(self.split_ratios) >= self.required_frames:
+            values = np.asarray(self.split_ratios[-self.required_frames :])
+            median = float(np.median(values))
+            self.last_mad = float(np.median(np.abs(values - median)))
+            if self.last_mad <= 0.015:
                 cv2.line(
-                    frame, (int(midpoint_x), 0), (int(midpoint_x), h), (0, 255, 0), 2
-                )
-                cv2.putText(
                     frame,
-                    f"Estimating Split: {len(self.split_ratios)}/{self.required_frames}",
-                    (50, 50),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    1,
+                    (int(median * width), 0),
+                    (int(median * width), height),
                     (0, 255, 0),
                     2,
                 )
-
-        return None
+        return (
+            float(np.median(self.split_ratios[-self.required_frames :]))
+            if self.is_split_ready()
+            else None
+        )
 
     def is_split_ready(self) -> bool:
-        """Returns True if the target number of stable split readings has been reached."""
-        return len(self.split_ratios) >= self.required_frames
+        """Require enough readings and low robust dispersion."""
+        if len(self.split_ratios) < self.required_frames:
+            return False
+        values = np.asarray(self.split_ratios[-self.required_frames :])
+        median = np.median(values)
+        self.last_mad = float(np.median(np.abs(values - median)))
+        return self.last_mad <= 0.015

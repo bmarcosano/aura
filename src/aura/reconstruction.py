@@ -1,14 +1,15 @@
-"""
-Module for 3D pose reconstruction, landmark fusion, and multi-view triangulation.
+"""Mirror-assisted 3D triangulation and a compatibility-only landmark fusion path.
 
-Combines direct-view and rectified mirror-view 2D pixel landmarks into a unified
-metric 3D Digital Twin representation using absolute camera calibration and affine
-reflection matrices.
+The reflected view is modelled as a virtual camera. For a mirror plane
+n.T @ X + d = 0, the reflection is X_ref = H @ X + t, where
+H = I - 2*n*n.T and t = -2*d*n. H is an orthogonal reflection (det=-1),
+not a physical camera rotation; it is nevertheless a valid projective mapping.
 """
 
 from __future__ import annotations
 
 import logging
+import warnings
 
 import cv2
 import numpy as np
@@ -17,25 +18,83 @@ logger = logging.getLogger(__name__)
 
 
 class StereoReconstructor:
+    """Triangulate landmarks from direct and mirror-reflected image observations.
+
+    Input pixel coordinates must refer to the full camera image (not local ROI
+    coordinates). Both views must use the same calibrated camera intrinsics and
+    the same image-coordinate convention. If images were already undistorted,
+    pass ``dist_coeffs=None``.
     """
-    Reconstructs exact 3D skeletal landmarks from multi-view 2D pixel coordinates
-    (direct camera and virtual reflected camera), utilizing affine reflection geometry
-    and intrinsic camera calibration to minimize reprojection error.
-    """
 
-    def __init__(self, camera_matrix: np.ndarray) -> None:
-        """
-        Initializes the reconstructor with the physical camera intrinsic matrix.
+    def __init__(
+        self,
+        camera_matrix: np.ndarray,
+        dist_coeffs: np.ndarray | None = None,
+    ) -> None:
+        K = np.asarray(camera_matrix, dtype=np.float64)
+        if (
+            K.shape != (3, 3)
+            or not np.isfinite(K).all()
+            or abs(np.linalg.det(K)) < 1e-12
+        ):
+            raise ValueError("camera_matrix must be a finite, invertible 3x3 matrix")
+        self.camera_matrix = K
+        self.dist_coeffs = (
+            None if dist_coeffs is None else np.asarray(dist_coeffs, dtype=np.float64)
+        )
+        self.P1 = K @ np.hstack((np.eye(3), np.zeros((3, 1))))
+        self.last_valid_mask = np.zeros(0, dtype=bool)
+        self.last_reprojection_errors = np.empty((0, 2), dtype=np.float64)
+        self.last_diagnostics: dict[str, float | int | str] = {}
 
-        Args:
-            camera_matrix: 3x3 camera intrinsic matrix (K) from calibration.
-        """
-        self.camera_matrix = camera_matrix
+    def _prepare_points(self, points: np.ndarray) -> np.ndarray:
+        """Undistort pixel observations when raw (distorted) frames are used."""
+        pts = np.asarray(points, dtype=np.float64)
+        if pts.ndim != 2 or pts.shape[1] != 2:
+            raise ValueError("2D landmarks must have shape (N, 2)")
+        if self.dist_coeffs is not None and np.any(np.abs(self.dist_coeffs) > 1e-12):
+            finite = np.isfinite(pts).all(axis=1)
+            safe_points = pts.copy()
+            # OpenCV should never receive NaN/Inf input, even for landmarks later rejected.
+            safe_points[~finite] = 0.0
+            corrected = cv2.undistortPoints(
+                safe_points.astype(np.float64).reshape(-1, 1, 2),
+                self.camera_matrix,
+                self.dist_coeffs,
+                P=self.camera_matrix,
+            ).reshape(-1, 2)
+            corrected[~finite] = np.nan
+            pts = corrected
+        return pts
 
-        # P1 is the projection matrix for the direct view (physical camera).
-        # Assuming the camera is at the origin: P1 = K [ I | 0 ]
-        extrinsics_direct = np.hstack((np.eye(3), np.zeros((3, 1))))
-        self.P1 = np.dot(self.camera_matrix, extrinsics_direct)
+    @staticmethod
+    def _projection_matrix(
+        reflection_matrix: np.ndarray, camera_matrix: np.ndarray
+    ) -> np.ndarray:
+        """Build P2 = K [H | t] from a 4x4 affine reflection or a 3x4 mapping."""
+        transform = np.asarray(reflection_matrix, dtype=np.float64)
+        if transform.shape == (4, 4):
+            extrinsics = transform[:3, :4]
+        elif transform.shape == (3, 4):
+            extrinsics = transform
+        else:
+            raise ValueError("reflection_matrix must have shape (4,4) or (3,4)")
+        if not np.isfinite(extrinsics).all():
+            raise ValueError("reflection_matrix contains non-finite values")
+        if transform.shape == (4, 4):
+            if not np.allclose(transform[3], [0.0, 0.0, 0.0, 1.0], atol=1e-6):
+                raise ValueError(
+                    "The 4x4 transform must be affine with last row [0,0,0,1]"
+                )
+            H = transform[:3, :3]
+            # The linear component must be an orthogonal reflection (or a numerically close estimate).
+            if not np.allclose(H.T @ H, np.eye(3), atol=2e-2) or not np.isclose(
+                np.linalg.det(H), -1.0, atol=2e-2
+            ):
+                raise ValueError(
+                    "The 3x3 linear component is not a valid Householder reflection"
+                )
+        return camera_matrix @ extrinsics
 
     def _check_reprojection_error(
         self,
@@ -45,109 +104,177 @@ class StereoReconstructor:
         P2: np.ndarray,
         max_error_px: float = 15.0,
     ) -> bool:
-        """
-        Verifies how well a triangulated 3D point matches the original 2D observations.
-
-        Args:
-            pt3d: (3,) numpy array representing the 3D point.
-            pt2d_direct: (2,) numpy array representing the pixel coordinate in the direct view.
-            pt2d_reflected: (2,) numpy array representing the pixel coordinate in the mirror view.
-            P2: 3x4 projection matrix of the reflected view.
-            max_error_px: Maximum acceptable reprojection error in pixels.
-
-        Returns:
-            True if the error in both views is below the threshold, False otherwise.
-        """
-        pt3d_homog = np.array([pt3d[0], pt3d[1], pt3d[2], 1.0])
-
-        # Reprojection onto direct view
-        proj1 = self.P1 @ pt3d_homog
-        if proj1[2] == 0:
+        """Return True only when both projections are finite, in front, and close."""
+        point = np.r_[np.asarray(pt3d, dtype=np.float64).reshape(3), 1.0]
+        q1, q2 = self.P1 @ point, P2 @ point
+        if q1[2] <= 1e-8 or q2[2] <= 1e-8:
             return False
-        proj1 = proj1[:2] / proj1[2]
-        err1 = np.linalg.norm(proj1 - pt2d_direct)
-
-        # Reprojection onto reflected view
-        proj2 = P2 @ pt3d_homog
-        if proj2[2] == 0:
-            return False
-        proj2 = proj2[:2] / proj2[2]
-        err2 = np.linalg.norm(proj2 - pt2d_reflected)
-
-        return err1 < max_error_px and err2 < max_error_px
+        p1, p2 = q1[:2] / q1[2], q2[:2] / q2[2]
+        err1 = float(np.linalg.norm(p1 - pt2d_direct))
+        err2 = float(np.linalg.norm(p2 - pt2d_reflected))
+        return bool(
+            np.isfinite(err1 + err2) and err1 <= max_error_px and err2 <= max_error_px
+        )
 
     def triangulate_landmarks(
         self,
         points_2d_direct: np.ndarray,
         points_2d_reflected: np.ndarray,
         reflection_matrix: np.ndarray,
+        max_error_px: float = 15.0,
+        direct_confidence: np.ndarray | None = None,
+        reflected_confidence: np.ndarray | None = None,
+        min_confidence: float = 0.35,
     ) -> np.ndarray:
+        """Triangulate corresponding full-frame pixel landmarks.
+
+        The legacy first three arguments are preserved. Invalid points are NaN
+        in the returned ``(N,3)`` array and marked False in ``last_valid_mask``.
+        This avoids silently presenting rejected observations as valid 3D data.
         """
-        Triangulates 3D points from 2D pixel coordinates of the direct and reflected views,
-        using the affine reflection matrix of the mirror. Rejects points with high reprojection error.
+        raw1 = np.asarray(points_2d_direct, dtype=np.float64)
+        raw2 = np.asarray(points_2d_reflected, dtype=np.float64)
+        if raw1.ndim != 2 or raw1.shape[1] != 2 or raw1.shape != raw2.shape:
+            raise ValueError("Both 2D landmark arrays must have identical shape (N,2)")
+        if raw1.shape[0] == 0:
+            self.last_valid_mask = np.zeros(0, dtype=bool)
+            self.last_reprojection_errors = np.empty((0, 2), dtype=np.float64)
+            return np.empty((0, 3), dtype=np.float64)
 
-        Args:
-            points_2d_direct: Nx2 numpy array of (x, y) pixel coordinates (direct view).
-            points_2d_reflected: Nx2 numpy array of (x, y) pixel coordinates (mirror view).
-            reflection_matrix: 4x4 affine reflection matrix (from ArUco tracker or SVD).
+        pts1, pts2 = self._prepare_points(raw1), self._prepare_points(raw2)
+        P2 = self._projection_matrix(reflection_matrix, self.camera_matrix)
+        n = len(pts1)
+        conf1 = (
+            np.ones(n)
+            if direct_confidence is None
+            else np.asarray(direct_confidence, dtype=float).reshape(-1)
+        )
+        conf2 = (
+            np.ones(n)
+            if reflected_confidence is None
+            else np.asarray(reflected_confidence, dtype=float).reshape(-1)
+        )
+        if conf1.size != n or conf2.size != n:
+            raise ValueError("Confidence arrays must contain one value per landmark")
 
-        Returns:
-            Nx3 numpy array of reconstructed 3D points in the camera coordinate system.
-            Points failing the reprojection check will be preserved but can be filtered downstream.
-        """
-        # Ensure the inputs are float32 arrays
-        pts1 = np.asarray(points_2d_direct, dtype=np.float32)
-        pts2 = np.asarray(points_2d_reflected, dtype=np.float32)
+        output = np.full((n, 3), np.nan, dtype=np.float64)
+        valid = np.zeros(n, dtype=bool)
+        errors = np.full((n, 2), np.inf, dtype=np.float64)
+        finite_observations = np.isfinite(pts1).all(axis=1) & np.isfinite(pts2).all(
+            axis=1
+        )
+        confidence_ok = (conf1 >= min_confidence) & (conf2 >= min_confidence)
 
-        # 1. Extract the 3x4 extrinsic matrix from the 4x4 reflection matrix.
-        # This defines the pose of the "virtual camera" behind the mirror.
-        extrinsics_reflected = reflection_matrix[:3, :4]
-
-        # 2. Build the projection matrix for the reflected view: P2 = K [ R_ref | t_ref ]
-        P2 = np.dot(self.camera_matrix, extrinsics_reflected)
-
-        # 3. OpenCV's triangulatePoints requires 2xN arrays
-        pts1_t = pts1.T
-        pts2_t = pts2.T
-
-        # 4. Triangulate the points
-        # Returns a 4xN array in homogeneous coordinates (X, Y, Z, W)
-        points_4d_hom = cv2.triangulatePoints(self.P1, P2, pts1_t, pts2_t)
-
-        # 5. Convert from homogeneous to 3D Euclidean coordinates (divide by W)
-        # Add a small epsilon to avoid division by zero
-        W = points_4d_hom[3, :] + 1e-7
-        points_3d = (points_4d_hom[:3, :] / W).T
-
-        # 6. Reprojection Check Pipeline (Optional flagging/smoothing can be implemented here)
-        # For now, we compute it to log severe geometric mismatches
-        valid_points_count = 0
-        for i in range(len(points_3d)):
-            if self._check_reprojection_error(
-                points_3d[i], pts1[i], pts2[i], P2, max_error_px=15.0
-            ):
-                valid_points_count += 1
-
-        if valid_points_count < len(points_3d) * 0.5:
-            logger.warning(
-                f"Low reconstruction quality: only {valid_points_count}/{len(points_3d)} points passed reprojection check."
+        indices = np.flatnonzero(finite_observations & confidence_ok)
+        if indices.size:
+            homogeneous = cv2.triangulatePoints(
+                self.P1.astype(np.float64),
+                P2.astype(np.float64),
+                pts1[indices].T.astype(np.float64),
+                pts2[indices].T.astype(np.float64),
             )
+            for column, index in enumerate(indices):
+                w = float(homogeneous[3, column])
+                if not np.isfinite(w) or abs(w) < 1e-10:
+                    continue
+                point = homogeneous[:3, column] / w
+                if not np.isfinite(point).all():
+                    continue
+                point_h = np.r_[point, 1.0]
+                q1, q2 = self.P1 @ point_h, P2 @ point_h
+                if q1[2] <= 1e-8 or q2[2] <= 1e-8:
+                    continue
+                reproj1, reproj2 = q1[:2] / q1[2], q2[:2] / q2[2]
+                errors[index] = [
+                    np.linalg.norm(reproj1 - pts1[index]),
+                    np.linalg.norm(reproj2 - pts2[index]),
+                ]
+                if max(errors[index]) <= max_error_px:
+                    output[index] = point
+                    valid[index] = True
 
-        # 7. Return as an Nx3 array to match standard landmark shapes
-        return points_3d
+        self.last_valid_mask = valid
+        self.last_reprojection_errors = errors
+        accepted = int(valid.sum())
+        finite_err = errors[valid]
+        mean_error = float(np.mean(finite_err)) if finite_err.size else float("inf")
+        self.last_diagnostics = {
+            "accepted_points": accepted,
+            "total_points": n,
+            "mean_reprojection_error_px": mean_error,
+            "status": "VALID" if accepted else "INVALID",
+        }
+        if accepted < max(1, int(np.ceil(0.5 * n))):
+            logger.warning(
+                "Low triangulation yield: %d/%d landmarks accepted", accepted, n
+            )
+        return output
 
-    def fuse_landmarks(self, *args, **kwargs):
+    def fuse_landmarks(self, *args, **kwargs) -> np.ndarray:
+        """Legacy confidence-weighted fusion of two already aligned 3D arrays.
+
+        This method is retained for API compatibility only. Its output is not a
+        calibrated camera-space reconstruction. New mirror code must call
+        ``triangulate_landmarks`` with 2D image observations.
         """
-        Legacy wrapper for backward compatibility.
-        Previously used to average two independent 3D pose estimations.
-        Raises a deprecation warning and directs to the new stereoscopic pipeline.
-        """
-        import warnings
-
         warnings.warn(
-            "fuse_landmarks is deprecated. AURA now uses true Multi-View Geometry. "
-            "Please use triangulate_landmarks(points_2d_direct, points_2d_reflected, reflection_matrix) instead.",
+            "fuse_landmarks() is a legacy model-space blend; use triangulate_landmarks() for geometry.",
             DeprecationWarning,
             stacklevel=2,
         )
-        # Fallback to a dummy return if old modules forcibly invoke it without matrix context
+        # Keep the historical variadic API while accepting descriptive keyword names.
+        front_landmarks = (
+            args[0] if len(args) > 0 else kwargs.pop("front_landmarks", None)
+        )
+        rectified_mirror_landmarks = (
+            args[1] if len(args) > 1 else kwargs.pop("rectified_mirror_landmarks", None)
+        )
+        front_visibility = (
+            args[2] if len(args) > 2 else kwargs.pop("front_visibility", None)
+        )
+        mirror_visibility = (
+            args[3] if len(args) > 3 else kwargs.pop("mirror_visibility", None)
+        )
+        is_anthropometrically_valid = (
+            args[4]
+            if len(args) > 4
+            else kwargs.pop("is_anthropometrically_valid", True)
+        )
+        if front_landmarks is None:
+            raise TypeError("front_landmarks is required")
+        if kwargs:
+            raise TypeError(f"Unexpected keyword arguments: {', '.join(kwargs)}")
+        front = np.asarray(front_landmarks, dtype=np.float64)
+        if front.ndim != 2 or front.shape[1] != 3:
+            raise ValueError("front_landmarks must have shape (N,3)")
+        if rectified_mirror_landmarks is None or not is_anthropometrically_valid:
+            return front.copy()
+        mirror = np.asarray(rectified_mirror_landmarks, dtype=np.float64)
+        if mirror.shape != front.shape:
+            raise ValueError("Both legacy 3D arrays must have identical shape")
+        wf = (
+            np.ones(len(front))
+            if front_visibility is None
+            else np.asarray(front_visibility, dtype=float).reshape(-1)
+        )
+        wm = (
+            np.ones(len(front))
+            if mirror_visibility is None
+            else np.asarray(mirror_visibility, dtype=float).reshape(-1)
+        )
+        if wf.size != len(front) or wm.size != len(front):
+            raise ValueError("Visibility arrays must contain one value per landmark")
+        wf = np.clip(np.nan_to_num(wf), 0.0, 1.0)
+        wm = np.clip(np.nan_to_num(wm), 0.0, 1.0)
+        denominator = wf + wm
+        result = front.copy()
+        good = (
+            np.isfinite(front).all(axis=1)
+            & np.isfinite(mirror).all(axis=1)
+            & (denominator > 1e-8)
+        )
+        result[good] = (
+            front[good] * wf[good, None] + mirror[good] * wm[good, None]
+        ) / denominator[good, None]
+        result[~np.isfinite(front).all(axis=1)] = np.nan
+        return result

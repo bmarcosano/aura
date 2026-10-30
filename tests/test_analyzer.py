@@ -2,6 +2,8 @@
 test_analyzer.py: Unit tests for PostureAnalyzer module.
 """
 
+import math
+
 import numpy as np
 import pytest
 
@@ -34,7 +36,7 @@ def test_analyze_shoulders_invalid_input(landmarks, expected_status):
     result = analyzer.analyze_shoulders(landmarks)
 
     # Assert
-    assert result["tilt_angle_degrees"] == 0.0
+    assert math.isnan(result["tilt_angle_degrees"])
     assert result["status"] == expected_status
 
 
@@ -43,8 +45,8 @@ def test_analyze_shoulders_optimal():
     # Arrange
     analyzer = PostureAnalyzer()
     landmarks = np.zeros((33, 4), dtype=np.float32)
-    landmarks[11] = [100.0, 100.0, 0.0, 0.99]  # Left shoulder
-    landmarks[12] = [200.0, 100.0, 0.0, 0.99]  # Right shoulder (same Y -> 0 deg tilt)
+    landmarks[11] = [100.0, 200.0, 0.0, 0.99]  # Left shoulder
+    landmarks[12] = [200.0, 200.0, 0.0, 0.99]  # Right shoulder (same Y -> 0 deg tilt)
 
     # Act
     result = analyzer.analyze_shoulders(landmarks)
@@ -144,14 +146,13 @@ def test_analyze_head_frontal_invalid_input():
     analyzer = PostureAnalyzer()
 
     # Act & Assert
-    assert analyzer.analyze_head_posture_frontal(None) == {
-        "lateral_shift_ratio": 0.0,
-        "status": "Unknown",
-    }
-    assert analyzer.analyze_head_posture_frontal(np.zeros((5, 4))) == {
-        "lateral_shift_ratio": 0.0,
-        "status": "Unknown",
-    }
+    result = analyzer.analyze_head_posture_frontal(None)
+    assert result["status"] == "Unknown"
+    assert math.isnan(result["lateral_shift_ratio"])
+
+    result = analyzer.analyze_head_posture_frontal(np.zeros((5, 4)))
+    assert result["status"] == "Unknown"
+    assert math.isnan(result["lateral_shift_ratio"])
 
 
 def test_analyze_head_frontal_zero_width():
@@ -167,7 +168,7 @@ def test_analyze_head_frontal_zero_width():
 
     # Assert
     assert result["status"] == "Unknown"
-    assert result["lateral_shift_ratio"] == 0.0
+    assert math.isnan(result["lateral_shift_ratio"])
 
 
 def test_analyze_head_frontal_optimal():
@@ -175,9 +176,9 @@ def test_analyze_head_frontal_optimal():
     # Arrange
     analyzer = PostureAnalyzer()
     landmarks = np.zeros((33, 4), dtype=np.float32)
-    landmarks[11] = [100.0, 100.0, 0.0, 0.99]
-    landmarks[12] = [300.0, 100.0, 0.0, 0.99]  # Midpoint is 200
-    landmarks[0] = [200.0, 50.0, 0.0, 0.99]  # Nose at 200 (zero offset)
+    landmarks[11] = [100.0, 200.0, 0.0, 0.99]
+    landmarks[12] = [300.0, 200.0, 0.0, 0.99]  # Midpoint is 200
+    landmarks[0] = [200.0, 100.0, 0.0, 0.99]  # Nose at 150 (zero offset)
 
     # Act
     result = analyzer.analyze_head_posture_frontal(landmarks)
@@ -192,11 +193,11 @@ def test_analyze_head_frontal_warning():
     # Arrange
     analyzer = PostureAnalyzer()
     landmarks = np.zeros((33, 4), dtype=np.float32)
-    landmarks[11] = [100.0, 100.0, 0.0, 0.99]
-    landmarks[12] = [300.0, 100.0, 0.0, 0.99]  # Shoulder width = 200 (midpoint = 200)
+    landmarks[11] = [100.0, 200.0, 0.0, 0.99]
+    landmarks[12] = [300.0, 200.0, 0.0, 0.99]  # Shoulder width = 200 (midpoint = 200)
     landmarks[0] = [
         220.0,
-        50.0,
+        150.0,
         0.0,
         0.99,
     ]  # Nose offset = 20 (ratio = 0.10 >= 0.08 warning threshold)
@@ -257,14 +258,12 @@ def test_analyze_head_sagittal_invalid_input():
     analyzer = PostureAnalyzer()
 
     # Act & Assert: Verify handling of None and short arrays
-    assert analyzer.analyze_head_posture_sagittal(None) == {
-        "forward_angle_degrees": 0.0,
-        "status": "Unknown",
-    }
-    assert analyzer.analyze_head_posture_sagittal(np.zeros((5, 4))) == {
-        "forward_angle_degrees": 0.0,
-        "status": "Unknown",
-    }
+    result = analyzer.analyze_head_posture_sagittal(None)
+    assert result["status"] == "Unknown"
+    assert math.isnan(result["forward_angle_degrees"])
+    result = analyzer.analyze_head_posture_sagittal(np.zeros((5, 4)))
+    assert result["status"] == "Unknown"
+    assert math.isnan(result["forward_angle_degrees"])
 
 
 def test_analyze_head_sagittal_warning_strict():

@@ -1,16 +1,24 @@
-"""
-detector.py: MediaPipe Pose estimation and webcam stream management.
-"""
+"""MediaPipe Pose adapter with explicit pixel and hip-centred coordinate APIs."""
 
 from __future__ import annotations
 
+import logging
+from typing import Any
+
 import cv2
-import mediapipe as mp
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 
 class PoseDetector:
-    """Handles video capture and real-time 3D pose landmark extraction using MediaPipe."""
+    """Wrap the legacy MediaPipe ``solutions.pose`` API.
+
+    ``get_landmark_array`` returns image pixels in columns X/Y, model-relative
+    Z, and visibility. ``get_world_landmark_array`` returns MediaPipe's
+    hip-centred model coordinates in metres; those are not world/camera
+    coordinates and must not be used as absolute calibration observations.
+    """
 
     def __init__(
         self,
@@ -20,10 +28,21 @@ class PoseDetector:
         min_detection_confidence: float = 0.5,
         min_tracking_confidence: float = 0.5,
     ) -> None:
-        # Direct initialization using modern MediaPipe solutions structure
+        try:
+            import mediapipe as mp
+        except (
+            ImportError
+        ) as exc:  # Keep non-vision modules importable without MediaPipe.
+            raise RuntimeError(
+                "MediaPipe is required to create PoseDetector. Install the project dependencies."
+            ) from exc
+
+        if not hasattr(mp, "solutions"):
+            raise RuntimeError(
+                "This AURA version requires MediaPipe's solutions.pose API."
+            )
         self.mp_pose = mp.solutions.pose
         self.mp_draw = mp.solutions.drawing_utils
-
         self.pose = self.mp_pose.Pose(
             static_image_mode=static_image_mode,
             model_complexity=model_complexity,
@@ -31,25 +50,25 @@ class PoseDetector:
             min_detection_confidence=min_detection_confidence,
             min_tracking_confidence=min_tracking_confidence,
         )
-
-        self.results = None
-        print("✅ PoseDetector initialized successfully.")
+        self.results: Any | None = None
+        self._last_image_size: tuple[int, int] | None = None
+        logger.info("PoseDetector initialized")
 
     def detect(self, frame: np.ndarray, draw: bool = True) -> np.ndarray | None:
-        """
-        Processes via MediaPipe, draws the skeleton overlay,
-        and returns the pixel landmark array.
-        """
-        h, w, _ = frame.shape
-        image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        image_rgb.flags.writeable = False
+        """Run pose inference and return ``(33, 4)`` image-pixel landmarks."""
+        if frame is None or frame.ndim != 3 or frame.size == 0:
+            self.results = None
+            return None
+        height, width = frame.shape[:2]
+        self._last_image_size = (width, height)
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        rgb.flags.writeable = False
+        try:
+            self.results = self.pose.process(rgb)
+        finally:
+            rgb.flags.writeable = True
 
-        self.results = self.pose.process(image_rgb)
-
-        image_rgb.flags.writeable = True
-
-        # Draw skeleton lines on the frame if requested and landmarks are found
-        if self.results.pose_landmarks and draw:
+        if draw and self.results and self.results.pose_landmarks:
             self.mp_draw.draw_landmarks(
                 frame,
                 self.results.pose_landmarks,
@@ -61,11 +80,10 @@ class PoseDetector:
                     color=(0, 0, 255), thickness=2, circle_radius=2
                 ),
             )
-
-        return self.get_landmark_array(w, h)
+        return self.get_landmark_array(width, height)
 
     def find_pose(self, frame: np.ndarray, draw: bool = True) -> np.ndarray:
-        """Legacy helper: processes frame and returns the annotated image copy."""
+        """Legacy helper that returns an annotated copy of the input frame."""
         image = frame.copy()
         self.detect(image, draw=draw)
         return image
@@ -73,29 +91,33 @@ class PoseDetector:
     def get_landmark_array(
         self, frame_width: int, frame_height: int
     ) -> np.ndarray | None:
-        """Extracts landmark coordinates (x, y in pixels, z, visibility) as a NumPy array."""
+        """Return ``(33, 4)``: X/Y pixels, relative Z, and visibility."""
         if not self.results or not self.results.pose_landmarks:
             return None
-
-        landmarks = []
-        for lm in self.results.pose_landmarks.landmark:
-            # Map normalized coordinates back to pixel space for x and y
-            landmarks.append(
-                [lm.x * frame_width, lm.y * frame_height, lm.z, lm.visibility]
-            )
-
-        return np.array(landmarks, dtype=np.float32)
+        rows = [
+            [lm.x * frame_width, lm.y * frame_height, lm.z, lm.visibility]
+            for lm in self.results.pose_landmarks.landmark
+        ]
+        return np.asarray(rows, dtype=np.float32)
 
     def get_world_landmark_array(self) -> np.ndarray | None:
-        """
-        Extracts real-world 3D coordinates (x, y, z in meters) with origin at the hip center.
-        Crucial for SVD mirror plane estimation and anthropometric validation.
-        """
+        """Return MediaPipe's hip-centred 3D pose estimate in metres (not camera XYZ)."""
         if not self.results or not self.results.pose_world_landmarks:
             return None
+        rows = [[lm.x, lm.y, lm.z] for lm in self.results.pose_world_landmarks.landmark]
+        return np.asarray(rows, dtype=np.float32)
 
-        landmarks = []
-        for lm in self.results.pose_world_landmarks.landmark:
-            landmarks.append([lm.x, lm.y, lm.z])
+    def get_visibility_array(self) -> np.ndarray | None:
+        """Return one visibility value per landmark, or None when no pose is detected."""
+        if not self.results or not self.results.pose_landmarks:
+            return None
+        return np.asarray(
+            [lm.visibility for lm in self.results.pose_landmarks.landmark],
+            dtype=np.float32,
+        )
 
-        return np.array(landmarks, dtype=np.float32)
+    def close(self) -> None:
+        """Release MediaPipe resources."""
+        if getattr(self, "pose", None) is not None:
+            self.pose.close()
+            self.pose = None

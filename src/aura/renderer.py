@@ -1,6 +1,6 @@
-"""
-renderer.py: Handles all OpenCV UI drawing, HUDs, and visual overlays.
-"""
+"""2D OpenCV overlays for controls, recording state, and descriptive posture metrics."""
+
+from __future__ import annotations
 
 import cv2
 import numpy as np
@@ -9,7 +9,7 @@ from aura.analyzer import PostureAnalyzer
 
 
 class AuraRenderer:
-    """Handles the rendering of all graphical overlays on OpenCV frames."""
+    """Draw compact status panels without changing pose or measurement data."""
 
     def __init__(self):
         self.font = cv2.FONT_HERSHEY_SIMPLEX
@@ -23,156 +23,110 @@ class AuraRenderer:
         has_golden,
         live_pacing_msg,
     ) -> None:
-        """Renders the sidebar menu with recording status and DTW evaluation."""
-        _, w, _ = frame.shape
-        panel_w, panel_h = 280, 340
-        x1, y1 = w - panel_w - 15, 15
-        x2, y2 = w - 15, y1 + panel_h
-
-        # Background overlay
+        """Render command hints and the most recent DTW result."""
+        if frame is None or frame.size == 0:
+            return
+        _, width = frame.shape[:2]
+        panel_w, panel_h = min(300, max(220, width // 3)), 330
+        x1, y1 = max(0, width - panel_w - 12), 12
+        x2, y2 = width - 8, min(frame.shape[0] - 8, y1 + panel_h)
         overlay = frame.copy()
-        cv2.rectangle(overlay, (x1, y1), (x2, y2), (30, 30, 30), -1)
-        cv2.addWeighted(overlay, 0.70, frame, 0.30, 0, frame)
-        cv2.rectangle(frame, (x1, y1), (x2, y2), (100, 100, 100), 1)
-
-        # 1. TITLE & MENU CONTROLS
+        cv2.rectangle(overlay, (x1, y1), (x2, y2), (25, 25, 25), -1)
+        cv2.addWeighted(overlay, 0.78, frame, 0.22, 0, frame)
         cv2.putText(
             frame,
-            "--- AURA CONTROLS ---",
-            (x1 + 15, y1 + 22),
+            "AURA CONTROLS",
+            (x1 + 12, y1 + 22),
             self.font,
-            0.43,
-            (200, 200, 200),
+            0.48,
+            (220, 220, 220),
             1,
             cv2.LINE_AA,
         )
-
         commands = [
-            ("[G] Rec Golden Rep (Single)", (220, 220, 220)),
-            ("[U] Rec User Execution", (220, 220, 220)),
-            ("[S] Stop & Evaluate", (220, 220, 220)),
-            ("[W] Save Golden (JSON)", (220, 220, 220)),
-            ("[L] Load Golden (JSON)", (220, 220, 220)),
-            ("[V] View Info & Status", (220, 220, 220)),
-            ("[D] Delete JSON File", (220, 220, 220)),
-            ("[Q] Quit AURA", (150, 150, 150)),
+            "G: record trainer reference",
+            "U: record user",
+            "S: stop/evaluate",
+            "W: save reference",
+            "L: load reference",
+            "D: delete reference",
+            "X: toggle mirror mode",
+            "M: toggle log detail",
+            "Q: quit",
         ]
-
-        for i, (text, color) in enumerate(commands):
+        y = y1 + 48
+        for text in commands:
             cv2.putText(
                 frame,
                 text,
-                (x1 + 15, y1 + 45 + (i * 18)),
+                (x1 + 12, y),
                 self.font,
-                0.40,
-                color,
+                0.36,
+                (210, 210, 210),
                 1,
                 cv2.LINE_AA,
             )
-
-        cv2.line(frame, (x1 + 15, y1 + 195), (x2 - 15, y1 + 195), (100, 100, 100), 1)
-
-        # 2. RECORDING STATUS
+            y += 18
+        y += 4
         cv2.putText(
             frame,
-            "STATUS:",
-            (x1 + 15, y1 + 215),
+            f"REC: {recording_state}",
+            (x1 + 12, y),
             self.font,
-            0.43,
-            (200, 200, 200),
+            0.42,
+            (0, 180, 255),
             1,
             cv2.LINE_AA,
         )
-
-        if recording_state == "IDLE":
-            cv2.putText(
-                frame,
-                "WAITING / IDLE",
-                (x1 + 75, y1 + 215),
-                self.font,
-                0.42,
-                (150, 150, 150),
-                1,
-                cv2.LINE_AA,
-            )
-        else:
-            if frame_count % 15 < 10:
-                cv2.circle(frame, (x1 + 80, y1 + 211), 5, (0, 0, 255), -1)
-
-            status_text = "GOLDEN" if recording_state == "RECORD_GOLDEN" else "USER"
-            cv2.putText(
-                frame,
-                f"REC {status_text}",
-                (x1 + 92, y1 + 215),
-                self.font,
-                0.42,
-                (0, 0, 255),
-                2,
-                cv2.LINE_AA,
-            )
-
-        mem_color = (0, 200, 0) if has_golden else (0, 0, 255)
-        mem_text = "Mem: READY" if has_golden else "Mem: EMPTY"
         cv2.putText(
             frame,
-            mem_text,
-            (x2 - 95, y1 + 215),
+            "Golden: READY" if has_golden else "Golden: EMPTY",
+            (x1 + 130, y),
             self.font,
             0.38,
-            mem_color,
+            (0, 220, 0) if has_golden else (0, 0, 255),
             1,
             cv2.LINE_AA,
         )
-
-        # 3. LIVE PACING FEEDBACK
-        if recording_state == "RECORD_USER" and live_pacing_msg:
+        y += 25
+        if live_pacing_msg:
             cv2.putText(
                 frame,
-                f"{live_pacing_msg}",
-                (x1 + 15, y1 + 242),
+                str(live_pacing_msg)[:38],
+                (x1 + 12, y),
                 self.font,
-                0.38,
-                (0, 140, 255),
+                0.36,
+                (0, 190, 255),
                 1,
                 cv2.LINE_AA,
             )
-
-        # 4. DTW EVALUATION RESULT
+            y += 22
         if dtw_result:
-            score = dtw_result.get("score", 0)
-            feedback = dtw_result.get("feedback", "")
+            score = float(dtw_result.get("score", 0.0))
+            feedback = str(dtw_result.get("feedback", dtw_result.get("error", "")))
             color = (
-                (0, 255, 0)
+                (0, 220, 0)
                 if score >= 85
-                else ((0, 165, 255) if score >= 60 else (0, 0, 255))
-            )
-
-            cv2.putText(
-                frame,
-                "LAST SCORE:",
-                (x1 + 15, y1 + 270),
-                self.font,
-                0.43,
-                (200, 200, 200),
-                1,
-                cv2.LINE_AA,
+                else (0, 165, 255)
+                if score >= 60
+                else (0, 0, 255)
             )
             cv2.putText(
                 frame,
-                f"{score}/100",
-                (x1 + 15, y1 + 300),
+                f"LAST SCORE: {score:.1f}/100",
+                (x1 + 12, min(y + 4, y2 - 30)),
                 self.font,
-                0.65,
+                0.5,
                 color,
                 2,
                 cv2.LINE_AA,
             )
             cv2.putText(
                 frame,
-                feedback,
-                (x1 + 95, y1 + 298),
+                feedback[:35],
+                (x1 + 12, min(y + 27, y2 - 10)),
                 self.font,
-                0.38,
+                0.34,
                 color,
                 1,
                 cv2.LINE_AA,
@@ -185,93 +139,48 @@ class AuraRenderer:
         analyzer: PostureAnalyzer,
         is_mirror_view: bool = False,
     ) -> None:
-        """Draws the postural alignment metrics HUD."""
-        sh_status, sh_color = "WAITING...", (180, 180, 180)
-        hip_status, hip_color = "WAITING...", (180, 180, 180)
-        head_status, head_color = "WAITING...", (180, 180, 180)
-
-        if (
-            pose_results
-            and hasattr(pose_results, "pose_landmarks")
-            and pose_results.pose_landmarks
-        ):
-            landmarks_np = np.array(
-                [[lm.x, lm.y, lm.z] for lm in pose_results.pose_landmarks.landmark]
+        """Draw frontal/profile alignment estimates; these remain 2D coaching proxies."""
+        statuses = {"Shoulders": "Unknown", "Pelvis": "Unknown", "Head": "Unknown"}
+        if pose_results and getattr(pose_results, "pose_landmarks", None):
+            landmarks = np.asarray(
+                [[lm.x, lm.y, lm.z] for lm in pose_results.pose_landmarks.landmark],
+                dtype=np.float32,
             )
-
-            sh_data = analyzer.analyze_shoulders(landmarks_np)
-            hip_data = analyzer.analyze_hips(landmarks_np)
-            head_data = (
-                analyzer.analyze_head_posture_sagittal(landmarks_np)
+            statuses["Shoulders"] = analyzer.analyze_shoulders(landmarks)["status"]
+            statuses["Pelvis"] = analyzer.analyze_hips(landmarks)["status"]
+            head = (
+                analyzer.analyze_head_posture_sagittal(landmarks)
                 if is_mirror_view
-                else analyzer.analyze_head_posture_frontal(landmarks_np)
+                else analyzer.analyze_head_posture_frontal(landmarks)
             )
-
-            def map_color(status: str):
-                if status == "Optimal":
-                    return (0, 200, 0)
-                elif status == "Warning":
-                    return (0, 140, 255)
-                elif status == "Poor":
-                    return (0, 0, 255)
-                return (180, 180, 180)
-
-            sh_status, sh_color = (
-                sh_data["status"].upper(),
-                map_color(sh_data["status"]),
-            )
-            hip_status, hip_color = (
-                hip_data["status"].upper(),
-                map_color(hip_data["status"]),
-            )
-            head_status, head_color = (
-                head_data["status"].upper(),
-                map_color(head_data["status"]),
-            )
-
+            statuses["Head"] = head["status"]
+        color_map = {
+            "Optimal": (0, 200, 0),
+            "Warning": (0, 140, 255),
+            "Poor": (0, 0, 255),
+            "Unknown": (170, 170, 170),
+        }
         overlay = frame.copy()
-        x1, y1, x2, y2 = 15, 15, 275, 145
-        cv2.rectangle(overlay, (x1, y1), (x2, y2), (30, 30, 30), -1)
-        cv2.addWeighted(overlay, 0.70, frame, 0.30, 0, frame)
-        cv2.rectangle(frame, (x1, y1), (x2, y2), (100, 100, 100), 1)
-
+        cv2.rectangle(overlay, (12, 12), (255, 132), (25, 25, 25), -1)
+        cv2.addWeighted(overlay, 0.72, frame, 0.28, 0, frame)
         cv2.putText(
             frame,
-            "--- POSTURE HUD ---",
-            (x1 + 10, y1 + 22),
+            "POSTURE (2D ESTIMATES)",
+            (22, 35),
             self.font,
-            0.43,
-            (200, 200, 200),
+            0.42,
+            (220, 220, 220),
             1,
             cv2.LINE_AA,
         )
-        cv2.putText(
-            frame,
-            f"Shoulders: {sh_status}",
-            (x1 + 10, y1 + 55),
-            self.font,
-            0.52,
-            sh_color,
-            2,
-            cv2.LINE_AA,
-        )
-        cv2.putText(
-            frame,
-            f"Pelvis/Hips: {hip_status}",
-            (x1 + 10, y1 + 88),
-            self.font,
-            0.52,
-            hip_color,
-            2,
-            cv2.LINE_AA,
-        )
-        cv2.putText(
-            frame,
-            f"Head Balance: {head_status}",
-            (x1 + 10, y1 + 121),
-            self.font,
-            0.52,
-            head_color,
-            2,
-            cv2.LINE_AA,
-        )
+        for index, (label, status) in enumerate(statuses.items()):
+            cv2.putText(
+                frame,
+                f"{label}: {status}",
+                (22, 65 + index * 22),
+                self.font,
+                0.42,
+                color_map[status],
+                1,
+                cv2.LINE_AA,
+            )

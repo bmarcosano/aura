@@ -1,92 +1,92 @@
-"""
-AURA - Multi-View Sensor Fusion Engine (v2.2.0 - Advanced Coaching Update)
-Combines front-view symmetry and knee alignment analysis with
-mirror-view profile biomechanics into a unified safety and form score.
-"""
+"""Fuse front/profile coaching observations without treating missing data as success."""
 
 from __future__ import annotations
 
+import numpy as np
+
 
 class AuraFusionEngine:
-    """Combines multi-view pose evaluations into a unified form and safety status."""
+    """Combine independent view-level heuristic assessments into one status."""
 
     def __init__(self):
-        # Weighting factors for global decision making
-        self.front_weight = 0.40  # Symmetry & Balance
-        self.mirror_weight = 0.60  # Spine & Torso safety (profile view)
+        self.front_weight = 0.40
+        self.mirror_weight = 0.60
+
+    @staticmethod
+    def _extract(results):
+        if results is None or not getattr(results, "pose_landmarks", None):
+            return None
+        return results.pose_landmarks.landmark
 
     def evaluate_posture(self, front_results, mirror_results):
-        """
-        Takes MediaPipe results from both views and returns
-        a unified posture evaluation with status and specific messages.
-        """
-        front_status = self._analyze_front(front_results)
-        mirror_status = self._analyze_mirror(mirror_results)
-
-        # Global override logic: Safety/Spine (Mirror) takes precedence if critical
-        if mirror_status["score"] == 0 or front_status["score"] == 0:
-            global_state = "POOR"
-            global_color = (0, 0, 255)  # Red
-        elif mirror_status["score"] == 1 or front_status["score"] == 1:
-            global_state = "WARNING"
-            global_color = (0, 140, 255)  # Orange
+        front = self._analyze_front(front_results)
+        mirror = self._analyze_mirror(mirror_results)
+        weighted_items = []
+        if front["score"] >= 0:
+            weighted_items.append((front["score"], self.front_weight))
+        if mirror["score"] >= 0:
+            weighted_items.append((mirror["score"], self.mirror_weight))
+        if not weighted_items:
+            weighted_score = float("nan")
+            state, color = "INSUFFICIENT_DATA", (160, 160, 160)
         else:
-            global_state = "OPTIMAL"
-            global_color = (0, 200, 0)  # Green
-
+            total_weight = sum(weight for _, weight in weighted_items)
+            weighted_score = (
+                sum(score * weight for score, weight in weighted_items) / total_weight
+            )
+            # A critical view-level failure takes precedence over the weighted mean.
+            if any(score == 0 for score, _ in weighted_items):
+                state, color = "POOR", (0, 0, 255)
+            elif len(weighted_items) < 2:
+                state, color = "PARTIAL", (0, 200, 255)
+            elif weighted_score < 1.5:
+                state, color = "WARNING", (0, 140, 255)
+            else:
+                state, color = "OPTIMAL", (0, 200, 0)
         return {
-            "state": global_state,
-            "color": global_color,
-            "front_msg": front_status["msg"],
-            "mirror_msg": mirror_status["msg"],
+            "state": state,
+            "color": color,
+            "front_msg": front["msg"],
+            "mirror_msg": mirror["msg"],
+            "weighted_score": float(weighted_score),
         }
 
     def _analyze_front(self, results):
-        """Analyzes front-view symmetry, shoulder/hip tilt, and knee alignment."""
-        if (
-            not results
-            or not hasattr(results, "pose_landmarks")
-            or not results.pose_landmarks
-        ):
-            return {"score": 2, "msg": "Waiting for front view..."}
-
+        landmarks = self._extract(results)
+        if landmarks is None:
+            return {"score": -1, "msg": "Front: insufficient data"}
         try:
-            lm = results.pose_landmarks.landmark
-            shoulder_tilt = abs(lm[11].y - lm[12].y)
-            hip_tilt = abs(lm[23].y - lm[24].y)
-
-            # Advanced kinematic check: Knee lateral deviation (Valgus / Tracking check)
-            l_knee_drift = abs(lm[25].x - lm[23].x)
-            r_knee_drift = abs(lm[26].x - lm[24].x)
-
+            required = [11, 12, 23, 24, 25, 26]
+            if any(landmarks[i].visibility < 0.35 for i in required):
+                return {"score": -1, "msg": "Front: low landmark visibility"}
+            shoulder_tilt = abs(landmarks[11].y - landmarks[12].y)
+            hip_tilt = abs(landmarks[23].y - landmarks[24].y)
+            left_drift = abs(landmarks[25].x - landmarks[23].x)
+            right_drift = abs(landmarks[26].x - landmarks[24].x)
             if shoulder_tilt > 0.07 or hip_tilt > 0.07:
-                return {"score": 0, "msg": "Front: Severe Asymmetry"}
-            elif l_knee_drift > 0.12 or r_knee_drift > 0.12:
-                return {"score": 1, "msg": "Front: Check Knee Alignment"}
-            elif shoulder_tilt > 0.03 or hip_tilt > 0.03:
-                return {"score": 1, "msg": "Front: Mild Tilt"}
-
-            return {"score": 2, "msg": "Front: Balanced"}
-        except (AttributeError, IndexError):
-            return {"score": 2, "msg": "Front: Tracking..."}
+                return {"score": 0, "msg": "Front: marked asymmetry"}
+            if left_drift > 0.12 or right_drift > 0.12:
+                return {"score": 1, "msg": "Front: review knee tracking"}
+            if shoulder_tilt > 0.03 or hip_tilt > 0.03:
+                return {"score": 1, "msg": "Front: mild alignment deviation"}
+            return {"score": 2, "msg": "Front: balanced"}
+        except (AttributeError, IndexError, TypeError):
+            return {"score": -1, "msg": "Front: tracking unavailable"}
 
     def _analyze_mirror(self, results):
-        """Analyzes mirror-view profile/biomechanics (Spine and Torso lean)."""
-        if (
-            not results
-            or not hasattr(results, "pose_landmarks")
-            or not results.pose_landmarks
-        ):
-            return {"score": 2, "msg": "Waiting for mirror/profile..."}
-
+        landmarks = self._extract(results)
+        if landmarks is None:
+            return {"score": -1, "msg": "Profile: insufficient data"}
         try:
-            lm = results.pose_landmarks.landmark
-            torso_lean = abs(lm[11].x - lm[23].x)
-
-            if torso_lean > 0.15:
-                return {"score": 0, "msg": "Mirror: Torso Lean Risk!"}
-            elif torso_lean > 0.08:
-                return {"score": 1, "msg": "Mirror: Check Spine Form"}
-            return {"score": 2, "msg": "Mirror: Profile Optimal"}
-        except (AttributeError, IndexError):
-            return {"score": 2, "msg": "Mirror: Tracking..."}
+            if landmarks[11].visibility < 0.35 or landmarks[23].visibility < 0.35:
+                return {"score": -1, "msg": "Profile: low landmark visibility"}
+            dx = landmarks[11].x - landmarks[23].x
+            dy = landmarks[11].y - landmarks[23].y
+            lean = abs(float(np.degrees(np.arctan2(dx, max(abs(dy), 1e-8)))))
+            if lean > 25:
+                return {"score": 0, "msg": "Profile: pronounced torso inclination"}
+            if lean > 15:
+                return {"score": 1, "msg": "Profile: review torso inclination"}
+            return {"score": 2, "msg": "Profile: no large inclination detected"}
+        except (AttributeError, IndexError, TypeError):
+            return {"score": -1, "msg": "Profile: tracking unavailable"}

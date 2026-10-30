@@ -1,39 +1,36 @@
-"""
-engine.py: Core application loop and state management for AURA.
-Includes multi-marker ArUco tracking for absolute spatial anchoring,
-Markerless SVD Fallback, dynamic floor grounding, Auto Splitter UI window,
-and unified 3D Digital Twin.
+"""Main AURA application loop and finite-state recording controller.
+
+Metric mirror reconstruction is enabled only when camera intrinsics have been
+validated for the current frame size and a calibrated ArUco marker is detected
+coplanar with the mirror plane. Markerless MediaPipe world
+landmarks are never silently promoted to camera-space metric coordinates.
 """
 
 from __future__ import annotations
 
-import math
+import logging
 import os
+from pathlib import Path
 
 import cv2
-import mediapipe as mp
 import numpy as np
 
 from aura.analyzer import PostureAnalyzer
+from aura.anthropometry import AnthropometricValidator
 from aura.detector import PoseDetector
 from aura.logger import AuraLogger
-from aura.mirror_plane import MirrorPlaneEstimator  # Imported the new math estimator
-
-# New Refactored Modules
-from aura.multi_detector import AnthropometricValidator, MultiSkeletonDetector
+from aura.mirror_plane import MirrorPlaneEstimator
+from aura.multi_detector import MultiSkeletonDetector
 from aura.reconstruction import StereoReconstructor
-
-# UI and Input modules
 from aura.renderer import AuraRenderer
 from aura.renderer_3d import Aura3DViewer
 from aura.roi_splitter import AutoROISplitter
 from aura.temporal import DTWTemporalAnalyzer
-
-# Aruco Tracking for absolute spatial metrology
 from aura.utils.aruco_tracker import ArucoMultiTracker
 from aura.utils.input_handler import KeyboardController
 
-# State Constants
+logger = logging.getLogger(__name__)
+
 STATE_SINGLE = "SINGLE_MODE"
 STATE_MIRROR = "MIRROR_MODE"
 REC_IDLE = "IDLE"
@@ -42,694 +39,540 @@ REC_USER = "RECORD_USER"
 
 
 class AuraEngine:
-    """Orchestrates the camera feed, biomechanical models, ArUco tracking, and UI rendering."""
+    """Orchestrate video, pose estimation, optional mirror reconstruction, and UI.
+
+    The public constructor and ``run``/``shutdown`` methods retain the current
+    AURA API. The ``x`` key explicitly enters/leaves mirror mode; automatic
+    reflection recognition is intentionally not used as a calibration signal.
+    """
 
     def __init__(self, source: str | int = "0", exercise: str = "squats") -> None:
         self.source = int(source) if str(source).isdigit() else source
         self.exercise = exercise
         self.cap = cv2.VideoCapture(self.source)
-
         if not self.cap.isOpened():
-            raise ValueError(f"❌ Error: Could not open video source '{self.source}'")
-
+            raise ValueError(f"Could not open video source '{self.source}'")
         fps = self.cap.get(cv2.CAP_PROP_FPS)
-        self.delay = int(1000 / fps) if fps > 0 else 33
+        self.delay = max(1, int(1000 / fps)) if fps and fps > 0 else 33
+        self.frame_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        self.frame_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-        frame_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        frame_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-
-        # --- CAMERA CALIBRATION & ARUCO ---
-        self.camera_matrix = None
-        self.dist_coeffs = None
+        self.camera_matrix: np.ndarray | None = None
+        self.dist_coeffs: np.ndarray | None = None
         self.apply_calibration = False
+        self.camera_is_calibrated = False
+        self.calibration_rms = float("inf")
+        self.calibration_path = os.environ.get(
+            "AURA_CALIBRATION_FILE", "camera_calibration.npz"
+        )
+        self._load_camera_calibration(self.calibration_path)
 
-        calib_path = "camera_calibration.npz"
-        if os.path.exists(calib_path):
-            with np.load(calib_path) as data:
-                loaded_camera_matrix = data["camera_matrix"]
-                loaded_dist_coeffs = data["dist_coeffs"]
-
-            if isinstance(self.source, int):
-                self.apply_calibration = True
-                self.camera_matrix = loaded_camera_matrix
-                self.dist_coeffs = loaded_dist_coeffs
-            else:
-                print(f"\n[INFO] Video source detected: {self.source}")
-                ans = (
-                    input("Apply optical calibration (undistort)? [y/N]: ")
-                    .strip()
-                    .lower()
-                )
-                if ans == "y":
-                    self.apply_calibration = True
-                    self.camera_matrix = loaded_camera_matrix
-                    self.dist_coeffs = loaded_dist_coeffs
-                else:
-                    self.apply_calibration = False
-
-        # Fallback: Generate a generic pinhole camera matrix for uncalibrated/synthetic video
-        if self.camera_matrix is None:
-            # Approximate focal length for a standard ~60 degree FOV camera
-            focal_length = frame_width
-            self.camera_matrix = np.array(
-                [
-                    [focal_length, 0, frame_width / 2.0],
-                    [0, focal_length, frame_height / 2.0],
-                    [0, 0, 1],
-                ],
-                dtype=np.float32,
-            )
-            self.dist_coeffs = np.zeros((4, 1), dtype=np.float32)
-            print(
-                f"[INFO] Using generic pinhole camera matrix (Focal: {focal_length}).\n"
+        self.reconstructor: StereoReconstructor | None = None
+        if self.camera_is_calibrated:
+            # Frames are undistorted before inference, therefore the reconstructor
+            # receives pixel coordinates in the calibrated undistorted image.
+            self.reconstructor = StereoReconstructor(
+                self.camera_matrix, dist_coeffs=None
             )
 
-        # Initialize ArUco tracker (marker size accurately set to 18cm = 0.18m)
-        self.aruco_tracker = ArucoMultiTracker(marker_size_m=0.18)
+        self.aruco_tracker: ArucoMultiTracker | None = None
+        try:
+            marker_size = float(os.environ.get("AURA_MARKER_SIZE_M", "0.18"))
+            self.aruco_tracker = ArucoMultiTracker(marker_size_m=marker_size)
+        except (RuntimeError, ValueError) as exc:
+            logger.warning("ArUco metric mode unavailable: %s", exc)
 
-        # --- COMPONENT INITIALIZATION ---
         self.single_detector = PoseDetector()
         self.posture_analyzer = PostureAnalyzer()
-
+        self.validator = AnthropometricValidator(
+            units="meters"
+        )  # Retained legacy engine attribute.
+        self.svd_estimator = MirrorPlaneEstimator(
+            ema_alpha=0.15
+        )  # Diagnostic fallback only; not metric calibration.
         self.splitter = AutoROISplitter()
         self.multi_detector: MultiSkeletonDetector | None = None
 
-        # New Structural Subsystems
-        self.reconstructor: StereoReconstructor | None = None
-        if self.camera_matrix is not None:
-            self.reconstructor = StereoReconstructor(self.camera_matrix)
-
-        self.svd_estimator = MirrorPlaneEstimator(ema_alpha=0.15)
-        self.validator = AnthropometricValidator(units="meters")
         self.dtw_analyzer = DTWTemporalAnalyzer(sensitivity=5.0)
-
-        # UI & Rendering
         self.renderer = AuraRenderer()
         self.viewer_3d = Aura3DViewer(width=800, height=600)
         self.sys_logger = AuraLogger()
 
-        # Silent Split setup
-        mp_pose = mp.solutions.pose
-        self.silent_checker_left = mp_pose.Pose(min_detection_confidence=0.5)
-        self.silent_checker_right = mp_pose.Pose(min_detection_confidence=0.5)
-        self.pearson_buffer_left: list[float] = []
-        self.pearson_buffer_right: list[float] = []
-
-        # System state
         self.current_state = STATE_SINGLE
         self.recording_state = REC_IDLE
-        self.dtw_last_result = None
+        self.dtw_last_result: dict | None = None
         self.frame_count = 0
+        self._record_buffer: list[np.ndarray] = []
+        self._recording_geometry_mode: str | None = None
+        self._golden_geometry_mode: str | None = None
+        self._last_render_landmarks: np.ndarray | None = None
+        self._last_grounding_offset = np.zeros(3, dtype=np.float64)
+        self._last_plane_normal: np.ndarray | None = None
+        self._last_plane_d: float | None = None
+        self._last_reconstruction_mode = "MONOCULAR_RELATIVE"
         self._window_placed = False
 
+        if self.camera_is_calibrated:
+            self.sys_logger.log_static(
+                "Calibration",
+                f"Valid K loaded ({self.frame_width}x{self.frame_height}, RMS {self.calibration_rms:.3f}px)",
+            )
+        else:
+            self.sys_logger.log_static(
+                "Calibration", "No valid camera calibration; metric stereo disabled"
+            )
+
+    def _load_camera_calibration(self, path: str) -> None:
+        """Load only calibrations whose stored image size matches this camera."""
+        file_path = Path(path)
+        if not file_path.is_file():
+            return
+        try:
+            with np.load(file_path, allow_pickle=False) as data:
+                K = np.asarray(data["camera_matrix"], dtype=np.float64)
+                D = np.asarray(data["dist_coeffs"], dtype=np.float64)
+                stored_size = tuple(
+                    int(v) for v in np.asarray(data["image_size"]).reshape(2)
+                )
+                rms = (
+                    float(np.asarray(data["rms"]).reshape(()))
+                    if "rms" in data
+                    else float("inf")
+                )
+            if (
+                K.shape != (3, 3)
+                or not np.isfinite(K).all()
+                or not np.isfinite(D).all()
+            ):
+                raise ValueError("Invalid calibration arrays")
+            if stored_size != (self.frame_width, self.frame_height):
+                raise ValueError(
+                    f"Calibration size {stored_size} != camera size {(self.frame_width, self.frame_height)}"
+                )
+            # A legacy file without image_size is deliberately not accepted as metric.
+            if not np.isfinite(rms) or rms > 2.0:
+                raise ValueError(f"Calibration RMS is not acceptable: {rms}")
+            self.camera_matrix, self.dist_coeffs = K, D
+            self.camera_is_calibrated = True
+            self.calibration_rms = rms
+            self.apply_calibration = True
+        except (OSError, KeyError, ValueError, TypeError) as exc:
+            logger.warning("Camera calibration ignored: %s", exc)
+
     def _ground_landmarks(self, landmarks_3d: np.ndarray | None) -> np.ndarray | None:
-        """
-        Dynamically grounds raw MediaPipe 3D world landmarks onto the floor grid (Y=0) EVERY FRAME.
-        MediaPipe world_landmarks are inherently hip-centered. By calculating the feet centroid
-        dynamically and applying it instantly (without EMA lag), the feet stay perfectly glued
-        to the floor, absorbing the squat naturally without vertical floating or lateral skating.
-        """
-        if landmarks_3d is None or len(landmarks_3d) != 33:
-            return landmarks_3d
-
-        grounded = landmarks_3d.copy()
-        feet_indices = [27, 28, 29, 30, 31, 32]  # Ankles, heels, toes
-
-        # Use np.max for Y to guarantee the absolute lowest physical point touches the floor
-        target_y = float(np.max(grounded[feet_indices, 1]))
-        target_x = float((grounded[27, 0] + grounded[28, 0]) / 2.0)
-        target_z = float((grounded[27, 2] + grounded[28, 2]) / 2.0)
-
-        # Instant subtraction: forces the feet to be locked at X=0, Z=0 and lowest point at Y=0
+        """Return a display-only grounded copy; never mutate metric coordinates."""
+        if landmarks_3d is None:
+            return None
+        points = np.asarray(landmarks_3d, dtype=np.float64)
+        if points.shape != (33, 3):
+            return None
+        grounded = points.copy()
+        feet = [27, 28, 29, 30, 31, 32]
+        valid_rows = np.isfinite(grounded[feet]).all(axis=1)
+        if not valid_rows.any():
+            self._last_grounding_offset = np.zeros(3, dtype=np.float64)
+            return None
+        visible_feet = grounded[np.asarray(feet)[valid_rows]]
+        # MediaPipe's model-space Y increases downward; this is only a display convention.
+        target_y = float(np.max(visible_feet[:, 1]))
+        target_x = float(np.median(visible_feet[:, 0]))
+        target_z = float(np.median(visible_feet[:, 2]))
+        self._last_grounding_offset = np.array(
+            [target_x, target_y, target_z], dtype=np.float64
+        )
         grounded[:, 0] -= target_x
         grounded[:, 1] -= target_y
         grounded[:, 2] -= target_z
-
+        grounded[~np.isfinite(grounded)] = np.nan
         return grounded
+
+    def _is_valid_roi(self, roi: np.ndarray | None) -> bool:
+        """Compatibility helper: report whether an ROI is a usable BGR image."""
+        return bool(
+            roi is not None
+            and isinstance(roi, np.ndarray)
+            and roi.ndim == 3
+            and roi.size > 0
+            and roi.shape[0] > 1
+            and roi.shape[1] > 1
+        )
+
+    def _check_silent_split(self, frame: np.ndarray, w: int) -> None:
+        """Legacy hook retained for callers; automatic split guesses do not enable stereo mode.
+
+        A reflection is a geometric hypothesis, not something that can be
+        confirmed by simple nose-motion correlation. Press X to enter the
+        mirror workflow or configure AURA_MIRROR_SPLIT_RATIO explicitly.
+        """
+        return
 
     def _evaluate_joint_colors(
         self, active_results, is_fused_valid: bool = True
     ) -> dict[int, str]:
-        """
-        Evaluates 3D joint posture against biomechanical golden standards and returns a
-        color mapping for rendering joints in the 3D viewport.
-        """
-        joint_colors: dict[int, str] = {}
+        """Return simple display colors from image-space knee angles."""
+        colors: dict[int, str] = {}
+        if not active_results or not getattr(active_results, "pose_landmarks", None):
+            return colors
+        lm = active_results.pose_landmarks.landmark
+        for knee_idx, hip_idx, ankle_idx in ((25, 23, 27), (26, 24, 28)):
+            indices = (hip_idx, knee_idx, ankle_idx)
+            if any(lm[i].visibility < 0.35 for i in indices):
+                colors[knee_idx] = "default"
+                continue
+            a = np.array([lm[hip_idx].x, lm[hip_idx].y])
+            b = np.array([lm[knee_idx].x, lm[knee_idx].y])
+            c = np.array([lm[ankle_idx].x, lm[ankle_idx].y])
+            from aura.geometry import calculate_angle
 
-        if (
-            not active_results
-            or not hasattr(active_results, "pose_landmarks")
-            or not active_results.pose_landmarks
-        ):
-            return joint_colors
-
-        landmarks = active_results.pose_landmarks.landmark
-
-        left_hip = np.array([landmarks[23].x, landmarks[23].y])
-        left_knee = np.array([landmarks[25].x, landmarks[25].y])
-        left_ankle = np.array([landmarks[27].x, landmarks[27].y])
-
-        right_hip = np.array([landmarks[24].x, landmarks[24].y])
-        right_knee = np.array([landmarks[26].x, landmarks[26].y])
-        right_ankle = np.array([landmarks[28].x, landmarks[28].y])
-
-        def compute_angle(a, b, c):
-            ba = a - b
-            bc = c - b
-            cosine_angle = np.dot(ba, bc) / (
-                np.linalg.norm(ba) * np.linalg.norm(bc) + 1e-6
+            angle = calculate_angle(a, b, c)
+            colors[knee_idx] = (
+                "warning" if np.isfinite(angle) and angle < 70 else "good"
             )
-            angle = np.arccos(np.clip(cosine_angle, -1.0, 1.0))
-            return np.degrees(angle)
-
-        left_knee_angle = compute_angle(left_hip, left_knee, left_ankle)
-        right_knee_angle = compute_angle(right_hip, right_knee, right_ankle)
-
-        for knee_idx, knee_angle in [(25, left_knee_angle), (26, right_knee_angle)]:
-            if knee_angle < 70.0:
-                joint_colors[knee_idx] = "warning"
-            elif knee_angle > 175.0:
-                joint_colors[knee_idx] = "good"
-            else:
-                joint_colors[knee_idx] = "good"
-
         if not is_fused_valid:
-            joint_colors[23] = "bad"
-            joint_colors[24] = "bad"
-            joint_colors[11] = "bad"
-            joint_colors[12] = "bad"
+            colors[23] = colors[24] = colors[11] = colors[12] = "warning"
+        return colors
 
-        if self.recording_state == REC_USER and self.dtw_last_result:
-            # Handle both Tuple and Dict returns gracefully for temporal.py compatibility
-            distance = 0.0
-            if isinstance(self.dtw_last_result, dict):
-                distance = self.dtw_last_result.get("deviation_per_frame", 0)
-            elif (
-                isinstance(self.dtw_last_result, tuple)
-                and len(self.dtw_last_result) > 0
-            ):
-                distance = self.dtw_last_result[0]
+    def _try_stereo_reconstruction(self, pipeline_data: dict, marker_poses: dict):
+        """Return (points, normal, d, mode, valid) for the current mirror frame."""
+        if (
+            not self.camera_is_calibrated
+            or self.reconstructor is None
+            or self.aruco_tracker is None
+        ):
+            return None, None, None, "MONOCULAR_RELATIVE", False
+        direct = pipeline_data.get("direct_pose_2d")
+        reflected = pipeline_data.get("reflected_pose_2d")
+        if (
+            direct is None
+            or reflected is None
+            or not pipeline_data.get("is_valid", False)
+        ):
+            return None, None, None, "MONOCULAR_RELATIVE", False
+        # Marker ID 1 is reserved for the marker attached to the mirror plane.
+        if 1 not in marker_poses:
+            return None, None, None, "MONOCULAR_RELATIVE", False
+        rvec, tvec = marker_poses[1]
+        diagnostics = self.aruco_tracker.last_reprojection_errors.get(1, float("inf"))
+        if diagnostics > 2.0:
+            return None, None, None, "INVALID", False
+        plane = self.aruco_tracker.estimate_mirror_plane(rvec, tvec)
+        points = self.reconstructor.triangulate_landmarks(
+            direct,
+            reflected,
+            plane["reflection_matrix"],
+            max_error_px=8.0,
+            direct_confidence=pipeline_data.get("direct_visibility"),
+            reflected_confidence=pipeline_data.get("reflected_visibility"),
+            min_confidence=0.35,
+        )
+        mask = self.reconstructor.last_valid_mask
+        required = [11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28]
+        enough = int(mask.sum()) >= 20 and all(mask[index] for index in required)
+        if not enough:
+            return None, plane["normal"], plane["d"], "INVALID", False
+        return points, plane["normal"], float(plane["d"]), "STEREO_ARUCO", True
 
-            if distance > 1.5:  # Adjusted for multidimensional feature vectors
-                joint_colors[27] = "warning"
-                joint_colors[28] = "warning"
+    def _record_features(
+        self,
+        feature_landmarks: np.ndarray | None,
+        feature_mode: str = "MONOCULAR_RELATIVE",
+    ) -> None:
+        """Append features only when the source mode matches the active reference.
 
-        return joint_colors
+        Using one mode consistently prevents a trainer trajectory captured from a
+        monocular pose model from being silently mixed with stereo camera-space data.
+        """
+        if feature_landmarks is None:
+            return
+        features = self.dtw_analyzer.extract_kinematic_features(feature_landmarks)
+        if not np.isfinite(features).all():
+            return
+        if self.recording_state == REC_GOLDEN:
+            if self._recording_geometry_mode is None:
+                self._recording_geometry_mode = feature_mode
+            if feature_mode == self._recording_geometry_mode:
+                self._record_buffer.append(features.copy())
+        elif self.recording_state == REC_USER:
+            expected = self.dtw_analyzer.reference_metadata.get("reconstruction_mode")
+            if expected and expected != feature_mode:
+                return
+            self.dtw_analyzer.add_user_frame(features)
 
     def run(self) -> None:
-        """Starts the main video loop."""
-
-        init_log = "AURA System Initialized. Looking for user..."
-        if self.camera_matrix is not None:
-            status = "applied" if self.apply_calibration else "loaded (not applied)"
-            init_log = (
-                f"AURA Initialized. Calibration file {status}. Looking for user..."
-            )
-
+        """Run the camera loop until the user quits or the source ends."""
         self.sys_logger.log(
-            init_log,
-            f"AuraEngine booted. Source: {self.source}, Target: {self.exercise}. FSM State: {STATE_SINGLE}.",
+            "AURA initialized. Press X to enter mirror mode.",
+            f"Source={self.source}; exercise={self.exercise}; metric_calibration={self.camera_is_calibrated}",
         )
+        try:
+            while self.cap.isOpened():
+                ok, frame = self.cap.read()
+                if not ok or frame is None or frame.size == 0:
+                    if isinstance(self.source, str):
+                        # Loop file sources; do not loop a disconnected camera.
+                        self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                        ok, frame = self.cap.read()
+                    if not ok or frame is None:
+                        break
+                self.frame_count += 1
 
-        while self.cap.isOpened():
-            success, frame = self.cap.read()
-
-            if not success or frame is None or frame.size == 0:
-                if self.recording_state != REC_IDLE:
-                    self.sys_logger.log(
-                        "Video ended. Auto-stopping evaluation.",
-                        "Stream EOF detected. Forcing FSM REC_IDLE fallback.",
+                if self.camera_is_calibrated and self.apply_calibration:
+                    frame = cv2.undistort(
+                        frame,
+                        self.camera_matrix,
+                        self.dist_coeffs,
+                        None,
+                        self.camera_matrix,
                     )
-                    if self.recording_state == REC_USER:
-                        self.dtw_last_result = self.dtw_analyzer.evaluate_technique()
-                    self.recording_state = REC_IDLE
-
-                self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                success, frame = self.cap.read()
-                if not success:
-                    break
-
-            self.frame_count += 1
-
-            # --- PHASE 1: OPTICAL CORRECTION AND ARUCO TRACKING ---
-            aruco_poses = {}
-            if self.camera_matrix is not None and self.dist_coeffs is not None:
-                if self.apply_calibration:
-                    frame = cv2.undistort(frame, self.camera_matrix, self.dist_coeffs)
-                    # CRITICAL FIX: The frame is now physically undistorted.
-                    # We must pass zeroed distortion coefficients to the ArUco tracker
-                    # to prevent it from double-applying the distortion mathematically.
-                    active_dist_coeffs = np.zeros((4, 1), dtype=np.float32)
+                    active_distortion = np.zeros((5, 1), dtype=np.float64)
                 else:
-                    active_dist_coeffs = self.dist_coeffs
+                    active_distortion = self.dist_coeffs
 
-                frame, aruco_poses = self.aruco_tracker.process_frame(
-                    frame, self.camera_matrix, active_dist_coeffs
-                )
+                marker_poses: dict = {}
+                if self.aruco_tracker is not None and self.camera_is_calibrated:
+                    frame, marker_poses = self.aruco_tracker.process_frame(
+                        frame, self.camera_matrix, active_distortion
+                    )
 
-            # Extract ArUco tracking data for Mirror Plane
-            aruco_rvec = None
-            aruco_tvec = None
-
-            if 0 in aruco_poses:
-                _rvec_floor, tvec_floor = aruco_poses[0]
-                floor_dist = np.linalg.norm(tvec_floor)
-                self.sys_logger.log_metric("Floor Dist", f"{floor_dist:.2f} m")
-
-            if 1 in aruco_poses:
-                aruco_rvec, aruco_tvec = aruco_poses[1]
-                mirror_dist = np.linalg.norm(aruco_tvec)
-                self.sys_logger.log_metric("Mirror Dist", f"{mirror_dist:.2f} m")
-
-            _, w = frame.shape[:2]
-            active_frame = None
-            active_results = None
-            front_roi = None
-            mirror_roi = None
-            fused_3d = None
-            plane_normal = None
-
-            # State flags for the current frame
-            is_stereo_validated = False
-            hud_status = "3D FUSION: SINGLE"
-
-            # ==========================================
-            # PHASE 2: SINGLE MODE
-            # ==========================================
-            if self.current_state == STATE_SINGLE:
+                # The full-frame detector remains the consistent source for HUD
+                # and Golden Standard feature extraction in every application mode.
                 display_frame = frame.copy()
-                active_frame = display_frame
-
                 self.single_detector.detect(display_frame, draw=True)
-                active_results = getattr(self.single_detector, "results", None)
+                active_results = self.single_detector.results
+                mono_landmarks = self.single_detector.get_world_landmark_array()
+                raw_landmarks = (
+                    mono_landmarks.copy() if mono_landmarks is not None else None
+                )
+                plane_normal = plane_d = None
+                reconstruction_mode = "MONOCULAR_RELATIVE"
+                stereo_valid = False
 
-                # Ground raw single-view 3D landmarks onto floor Y=0 dynamically
-                raw_landmarks = self.single_detector.get_world_landmark_array()
-                fused_3d = self._ground_landmarks(raw_landmarks)
+                if self.current_state == STATE_MIRROR:
+                    if self.multi_detector is None:
+                        ratio = self.splitter.update(frame)
+                        if ratio is not None:
+                            try:
+                                self.multi_detector = MultiSkeletonDetector(
+                                    split_ratio=ratio
+                                )
+                                self.sys_logger.log(
+                                    "Mirror ROIs initialized.",
+                                    f"Split ratio={ratio:.4f}",
+                                )
+                            except RuntimeError as exc:
+                                self.sys_logger.log(
+                                    "Mirror pose detector unavailable.", str(exc)
+                                )
+                        if self.multi_detector is None:
+                            cv2.putText(
+                                display_frame,
+                                "Mirror mode: estimating ROI split",
+                                (20, 35),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                0.6,
+                                (0, 200, 255),
+                                2,
+                            )
+                    else:
+                        pipeline = self.multi_detector.process_frame(frame)
+                        (
+                            raw_landmarks,
+                            plane_normal,
+                            plane_d,
+                            reconstruction_mode,
+                            stereo_valid,
+                        ) = self._try_stereo_reconstruction(pipeline, marker_poses)
+                        # Display both ROI crops for transparent debugging.
+                        if pipeline.get("front_roi") is not None:
+                            cv2.imshow("AURA - Direct ROI", pipeline["front_roi"])
+                        if pipeline.get("mirror_roi") is not None:
+                            cv2.imshow("AURA - Mirror ROI", pipeline["mirror_roi"])
+                        if not stereo_valid and mono_landmarks is not None:
+                            raw_landmarks = mono_landmarks.copy()
+                            reconstruction_mode = "MONOCULAR_RELATIVE"
+
+                # The rendered copy is grounded; raw metric or model coordinates are retained.
+                render_landmarks = self._ground_landmarks(raw_landmarks)
+                self._last_render_landmarks = render_landmarks
+                self._last_plane_normal = plane_normal
+                # Translate the plane equation along with the display-only skeleton grounding.
+                render_plane_d = (
+                    None
+                    if plane_d is None or plane_normal is None
+                    else float(
+                        plane_d + np.dot(plane_normal, self._last_grounding_offset)
+                    )
+                )
+                self._last_plane_d = render_plane_d
+                self._last_reconstruction_mode = reconstruction_mode
 
                 self.renderer.draw_postural_hud(
-                    display_frame,
-                    active_results,
-                    self.posture_analyzer,
-                    is_mirror_view=False,
+                    display_frame, active_results, self.posture_analyzer
                 )
-                self._check_silent_split(frame, w)
-
-            # ==========================================
-            # PHASE 3: MIRROR MODE (THE NEW PIPELINE)
-            # ==========================================
-            elif self.current_state == STATE_MIRROR:
-                if self.multi_detector is None:
-                    split_ratio = self.splitter.update(frame)
-                    window_title = "Auto Splitter: Detecting..."
-                    if split_ratio is not None:
-                        self.sys_logger.log(
-                            "Auto Splitter calibration successful.",
-                            "AutoROISplitter finalized ratio. Instantiating MultiSkeletonDetector.",
-                        )
-                        self.multi_detector = MultiSkeletonDetector(
-                            split_ratio=split_ratio
-                        )
-                        cv2.destroyWindow(window_title)
-                    else:
-                        cv2.imshow(window_title, frame)
-                        self.single_detector.detect(frame, draw=False)
-                        raw_landmarks = self.single_detector.get_world_landmark_array()
-                        fused_3d = self._ground_landmarks(raw_landmarks)
-                        active_frame = frame
-                else:
-                    # 1. Get 2D Pixel Landmarks
-                    pipeline_data = self.multi_detector.process_frame(frame)
-
-                    for user_msg, expert_msg in pipeline_data.get("logs", []):
-                        self.sys_logger.log(user_msg, expert_msg)
-
-                    front_roi = pipeline_data["front_roi"]
-                    mirror_roi = pipeline_data["mirror_roi"]
-                    active_results = pipeline_data["front_results"]
-                    mirror_results = pipeline_data["mirror_results"]
-
-                    direct_pose_2d = pipeline_data.get("direct_pose_2d")
-                    reflected_pose_2d = pipeline_data.get("reflected_pose_2d")
-
-                    active_frame = front_roi
-                    reflection_matrix = None
-
-                    # 2. Attempt Full Stereoscopic Pipeline (Priority Route)
-                    if (
-                        direct_pose_2d is not None
-                        and reflected_pose_2d is not None
-                        and self.reconstructor is not None
-                    ):
-                        if aruco_rvec is not None and aruco_tvec is not None:
-                            # Mode 1: Exact ArUco Tracker Metric Plane
-                            mirror_data = self.aruco_tracker.estimate_mirror_plane(
-                                aruco_rvec, aruco_tvec
-                            )
-                            reflection_matrix = mirror_data["reflection_matrix"]
-                            plane_normal = mirror_data["normal"]
-                            hud_status = "3D FUSION: STEREO (ARUCO)"
-                        else:
-                            # Mode 2: SVD Markerless Fallback
-                            direct_3d_local = self.multi_detector.front_detector.get_world_landmark_array()
-                            reflected_3d_local = self.multi_detector.mirror_detector.get_world_landmark_array()
-
-                            if (
-                                direct_3d_local is not None
-                                and reflected_3d_local is not None
-                            ):
-                                # 1. Flip the reflected 3D landmarks to match the direct view's coordinate system
-                                reflected_3d_unflipped = reflected_3d_local.copy()
-                                reflected_3d_unflipped[:, 0] *= -1
-
-                                # 2. SolvePnP to estimate camera poses for both views
-                                active_dist = np.zeros((4, 1), dtype=np.float32)
-                                if (
-                                    self.dist_coeffs is not None
-                                    and not self.apply_calibration
-                                ):
-                                    active_dist = self.dist_coeffs
-
-                                success1, rvec1, tvec1 = cv2.solvePnP(
-                                    direct_3d_local.astype(np.float32),
-                                    direct_pose_2d.astype(np.float32),
-                                    self.camera_matrix,
-                                    active_dist,
-                                    flags=cv2.SOLVEPNP_SQPNP,
-                                )
-                                success2, rvec2, tvec2 = cv2.solvePnP(
-                                    reflected_3d_unflipped.astype(np.float32),
-                                    reflected_pose_2d.astype(np.float32),
-                                    self.camera_matrix,
-                                    active_dist,
-                                    flags=cv2.SOLVEPNP_SQPNP,
-                                )
-
-                                if success1 and success2:
-                                    R1, _ = cv2.Rodrigues(rvec1)
-                                    R2, _ = cv2.Rodrigues(rvec2)
-
-                                    # 3. Transform the local landmarks to the absolute camera space
-                                    direct_3d_abs = (
-                                        R1 @ direct_3d_local.T
-                                    ).T + tvec1.reshape(1, 3)
-                                    reflected_3d_abs = (
-                                        R2 @ reflected_3d_unflipped.T
-                                    ).T + tvec2.reshape(1, 3)
-
-                                    # 4. Estimate the mirror plane using SVD on the absolute 3D landmarks
-                                    reflection_matrix, plane_normal = (
-                                        self.svd_estimator.estimate_plane(
-                                            direct_3d_abs, reflected_3d_abs
-                                        )
-                                    )
-                                    if reflection_matrix is not None:
-                                        hud_status = "3D FUSION: STEREO (SVD)"
-
-                        # Triangulate metric 3D landmarks if a plane was found
-                        if reflection_matrix is not None:
-                            raw_landmarks_3d = self.reconstructor.triangulate_landmarks(
-                                direct_pose_2d, reflected_pose_2d, reflection_matrix
-                            )
-
-                            # Validate metric integrity against human anatomy
-                            if self.validator.validate_skeleton_3d(raw_landmarks_3d):
-                                fused_3d = self._ground_landmarks(raw_landmarks_3d)
-                                is_stereo_validated = True
-                            else:
-                                self.sys_logger.log(
-                                    "Biometric invalidation.",
-                                    "AnthropometricValidator rejected 3D lengths. Falling back to single view.",
-                                )
-
-                    # 3. Fallback Route (Base Frontal Pose)
-                    if not is_stereo_validated and active_results:
-                        front_world_lm = self.multi_detector.front_detector.get_world_landmark_array()
-                        fused_3d = self._ground_landmarks(front_world_lm)
-                        hud_status = "3D FUSION: SINGLE"
-
-                    # HUD Drawing
-                    if self._is_valid_roi(front_roi):
-                        self.renderer.draw_postural_hud(
-                            front_roi,
-                            active_results,
-                            self.posture_analyzer,
-                            is_mirror_view=False,
-                        )
-                        cv2.putText(
-                            front_roi,
-                            hud_status,
-                            (15, 175),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.6,
-                            (0, 255, 0) if is_stereo_validated else (0, 0, 255),
-                            2,
-                            cv2.LINE_AA,
-                        )
-
-                    if self._is_valid_roi(mirror_roi) and mirror_results:
-                        self.renderer.draw_postural_hud(
-                            mirror_roi,
-                            mirror_results,
-                            self.posture_analyzer,
-                            is_mirror_view=True,
-                        )
-
-            # ==========================================
-            # PHASE 4: KINEMATIC EXTRACTION & PACING
-            # ==========================================
-            # Protect Golden Standard recordings from single-view relative estimations
-            if fused_3d is not None:
-                if is_stereo_validated:
-                    kinematic_features = self.dtw_analyzer.extract_kinematic_features(
-                        fused_3d
-                    )
-
-                    if self.recording_state == REC_GOLDEN:
-                        self.dtw_analyzer.golden_reference.append(
-                            kinematic_features.tolist()
-                        )
-                    elif self.recording_state == REC_USER:
-                        self.dtw_analyzer.add_user_frame(kinematic_features)
-                else:
-                    # Prevent silent injection of non-metric frames into DTW
-                    if self.recording_state in [REC_GOLDEN, REC_USER]:
-                        self.sys_logger.log(
-                            "Warning: Frame dropped from recording.",
-                            "Stereo triangulation inactive. Cannot record monocular fallback into Golden Standard.",
-                        )
-
-            live_pacing_msg = ""
-            if self.recording_state == REC_USER:
-                live_pacing_msg = self.dtw_analyzer.check_live_pacing()
-
-            # ==========================================
-            # PHASE 5: UI & UNIFIED 3D DIGITAL TWIN RENDER
-            # ==========================================
-            if active_frame is not None:
-                has_golden = len(self.dtw_analyzer.golden_reference) > 0
+                feature_landmarks = raw_landmarks if stereo_valid else mono_landmarks
+                feature_mode = (
+                    reconstruction_mode if stereo_valid else "MONOCULAR_RELATIVE"
+                )
+                self._record_features(feature_landmarks, feature_mode)
+                live_pacing = (
+                    self.dtw_analyzer.check_live_pacing()
+                    if self.recording_state == REC_USER
+                    else ""
+                )
                 self.renderer.draw_control_panel(
-                    active_frame,
+                    display_frame,
                     self.recording_state,
                     self.dtw_last_result,
                     self.frame_count,
-                    has_golden,
-                    live_pacing_msg,
+                    bool(self.dtw_analyzer.golden_reference),
+                    live_pacing,
                 )
+                cv2.putText(
+                    display_frame,
+                    f"3D: {reconstruction_mode}",
+                    (15, display_frame.shape[0] - 20),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    (0, 220, 220) if stereo_valid else (150, 150, 150),
+                    1,
+                    cv2.LINE_AA,
+                )
+                cv2.imshow("AURA - Magic Mirror", display_frame)
 
-            if self.current_state == STATE_SINGLE and active_frame is not None:
-                cv2.imshow("AURA - Active Tracking", active_frame)
-            elif self.current_state == STATE_MIRROR and self.multi_detector is not None:
-                if self._is_valid_roi(front_roi):
-                    cv2.imshow("AURA - Front View", front_roi)
-                if self._is_valid_roi(mirror_roi):
-                    cv2.imshow("AURA - Mirror View", mirror_roi)
+                colors = self._evaluate_joint_colors(
+                    active_results,
+                    is_fused_valid=stereo_valid or self.current_state == STATE_SINGLE,
+                )
+                scene = self.viewer_3d.render_scene(
+                    render_landmarks,
+                    plane_normal,
+                    colors,
+                    render_plane_d,
+                    reconstruction_mode,
+                )
+                cv2.imshow("AURA - 3D Digital Twin", scene)
 
-            # Evaluate biomechanical joint colors against golden standard
-            joint_colors = self._evaluate_joint_colors(
-                active_results, is_stereo_validated
-            )
-
-            # Render Single Unified 3D Viewport
-            cv2.imshow(
-                "AURA - 3D Digital Twin & SVD Inspector",
-                self.viewer_3d.render_scene(fused_3d, plane_normal, joint_colors),
-            )
-            cv2.imshow("AURA - System Logs", self.sys_logger.render_events())
-            cv2.imshow("AURA - Live Telemetry", self.sys_logger.render_metrics())
-
-            if not self._window_placed:
-                cv2.moveWindow("AURA - System Logs", 0, 0)
-                self._window_placed = True
-
-            # ==========================================
-            # PHASE 6: KEYBOARD INPUT HANDLING
-            # ==========================================
-            cmd, raw_key = KeyboardController.get_command(self.delay)
-
-            # Pass key to 3D Viewer orbit controls (handles Arrow keys & Numpad keys)
-            if raw_key != -1:
+                command, raw_key = KeyboardController.get_command(self.delay)
                 self.viewer_3d.handle_keyboard(raw_key)
-
-            if cmd != "NONE" and not self._handle_commands(cmd):
-                break
-
-        self.shutdown()
-
-    def _is_valid_roi(self, roi: np.ndarray | None) -> bool:
-        return (
-            roi is not None and roi.ndim == 3 and roi.shape[0] > 0 and roi.shape[1] > 0
-        )
-
-    def _check_silent_split(self, frame: np.ndarray, w: int) -> None:
-        if self.frame_count % 10 != 0:
-            return
-
-        mid = w // 2
-        left_half = cv2.cvtColor(frame[:, :mid], cv2.COLOR_BGR2RGB)
-        right_half = cv2.cvtColor(frame[:, mid:], cv2.COLOR_BGR2RGB)
-
-        res_left = self.silent_checker_left.process(left_half)
-        res_right = self.silent_checker_right.process(right_half)
-
-        if not (res_left.pose_landmarks and res_right.pose_landmarks):
-            self.pearson_buffer_left.clear()
-            self.pearson_buffer_right.clear()
-            return
-
-        left_x = [
-            lm.x * mid for lm in res_left.pose_landmarks.landmark if lm.visibility > 0.5
-        ]
-        right_x = [
-            mid + (lm.x * (w - mid))
-            for lm in res_right.pose_landmarks.landmark
-            if lm.visibility > 0.5
-        ]
-
-        if not (left_x and right_x):
-            self.pearson_buffer_left.clear()
-            self.pearson_buffer_right.clear()
-            return
-
-        body_gap = min(right_x) - max(left_x)
-        if body_gap <= w * 0.04:
-            self.pearson_buffer_left.clear()
-            self.pearson_buffer_right.clear()
-            return
-
-        self.pearson_buffer_left.append(res_left.pose_landmarks.landmark[0].y)
-        self.pearson_buffer_right.append(res_right.pose_landmarks.landmark[0].y)
-
-        if len(self.pearson_buffer_left) > 15:
-            self.pearson_buffer_left.pop(0)
-            self.pearson_buffer_right.pop(0)
-
-            n = len(self.pearson_buffer_left)
-            mean_l = sum(self.pearson_buffer_left) / n
-            mean_r = sum(self.pearson_buffer_right) / n
-
-            num = sum(
-                (self.pearson_buffer_left[i] - mean_l)
-                * (self.pearson_buffer_right[i] - mean_r)
-                for i in range(n)
-            )
-            den_l = math.sqrt(
-                sum((self.pearson_buffer_left[i] - mean_l) ** 2 for i in range(n))
-            )
-            den_r = math.sqrt(
-                sum((self.pearson_buffer_right[i] - mean_r) ** 2 for i in range(n))
-            )
-
-            pearson_r = (num / (den_l * den_r)) if (den_l > 0 and den_r > 0) else 0.0
-
-            if pearson_r > 0.95:
-                self.sys_logger.log(
-                    "Mirror detected! Processing dual views...",
-                    f"Temporal correlation positive (Pearson r={pearson_r:.2f} > 0.95). FSM State -> MIRROR_MODE.",
-                )
-                self.current_state = STATE_MIRROR
-                cv2.destroyWindow("AURA - Active Tracking")
+                if not self._handle_commands(command):
+                    break
+        finally:
+            self.shutdown()
 
     def _handle_commands(self, cmd: str) -> bool:
+        """Handle legacy recording commands plus explicit mirror-mode toggle."""
         if cmd == "QUIT":
-            self.sys_logger.log(
-                "Shutting down...", "SIGINT received. Terminating AURA gracefully."
-            )
             return False
-        elif cmd == "TOGGLE_LOG_MODE":
+        if cmd == "TOGGLE_LOG_MODE":
             self.sys_logger.toggle_mode()
-        elif cmd == "REC_GOLDEN":
-            self.sys_logger.log(
-                "Starting Trainer Recording.",
-                "Initiating REC_GOLDEN state. Buffer cleared.",
+        elif cmd == "TOGGLE_MIRROR":
+            self.current_state = (
+                STATE_SINGLE if self.current_state == STATE_MIRROR else STATE_MIRROR
             )
+            if self.current_state == STATE_SINGLE:
+                if self.multi_detector is not None:
+                    self.multi_detector.close()
+                    self.multi_detector = None
+            else:
+                self.splitter = AutoROISplitter()
+                manual_ratio = os.environ.get("AURA_MIRROR_SPLIT_RATIO")
+                if manual_ratio is not None:
+                    try:
+                        self.multi_detector = MultiSkeletonDetector(
+                            split_ratio=float(manual_ratio)
+                        )
+                        self.sys_logger.log(
+                            "Mirror ROIs initialized from configured split ratio."
+                        )
+                    except (ValueError, RuntimeError) as exc:
+                        self.multi_detector = None
+                        self.sys_logger.log(
+                            "Configured mirror split rejected.", str(exc)
+                        )
+            self.sys_logger.log(f"Mode changed: {self.current_state}")
+        elif cmd == "REC_GOLDEN":
             self.recording_state = REC_GOLDEN
-            self.dtw_analyzer.golden_reference.clear()
+            self._record_buffer = []
+            self._recording_geometry_mode = None
             self.dtw_last_result = None
+            self.sys_logger.log(
+                "Recording trainer reference.",
+                "Recording four 3D joint-angle features from the full-frame MediaPipe pose.",
+            )
         elif cmd == "REC_USER":
             if not self.dtw_analyzer.golden_reference:
-                self.sys_logger.log(
-                    "Error: Need a Trainer recording first!",
-                    "REC_USER aborted. DTW Golden reference array is empty.",
-                )
+                self.sys_logger.log("Load or record a trainer reference first.")
             else:
-                self.sys_logger.log(
-                    "Starting User Recording.",
-                    "Initiating REC_USER state. Live DTW tracing started.",
-                )
                 self.recording_state = REC_USER
                 self.dtw_analyzer.reset_user_buffer()
                 self.dtw_last_result = None
-        elif cmd == "STOP_REC":
-            if self.recording_state != REC_IDLE:
-                self.sys_logger.log(
-                    "Recording stopped. Analyzing technique...",
-                    f"FSM Transition {self.recording_state} -> REC_IDLE.",
+                expected_mode = self.dtw_analyzer.reference_metadata.get(
+                    "reconstruction_mode"
                 )
-                if self.recording_state == REC_USER:
-                    self.dtw_last_result = self.dtw_analyzer.evaluate_technique()
-
-                    # Handle Tuple or Dict return safely
-                    raw_dist = 0.0
-                    if isinstance(self.dtw_last_result, dict):
-                        raw_dist = self.dtw_last_result.get("raw_distance", 0)
-                    elif (
-                        isinstance(self.dtw_last_result, tuple)
-                        and len(self.dtw_last_result) > 1
-                    ):
-                        raw_dist = self.dtw_last_result[1]
-
-                    self.sys_logger.log(
-                        "Analysis complete.", f"DTW Path Cost Distance: {raw_dist:.2f}"
+                self.sys_logger.log(
+                    "Recording user execution.",
+                    f"Reference reconstruction mode={expected_mode or 'legacy/unspecified'}",
+                )
+        elif cmd == "STOP_REC":
+            if self.recording_state == REC_GOLDEN:
+                if len(self._record_buffer) >= 5:
+                    self.dtw_analyzer.load_golden_standard(
+                        np.vstack(self._record_buffer)
                     )
-                self.recording_state = REC_IDLE
+                    self._golden_geometry_mode = self._recording_geometry_mode
+                    self.dtw_analyzer.reference_metadata = {
+                        "reconstruction_mode": self._golden_geometry_mode,
+                        "exercise": self.exercise,
+                    }
+                    self.sys_logger.log(
+                        f"Trainer reference captured ({len(self._record_buffer)} frames, mode={self._golden_geometry_mode})."
+                    )
+                else:
+                    self.sys_logger.log(
+                        "Trainer reference rejected: not enough valid frames."
+                    )
+            elif self.recording_state == REC_USER:
+                self.dtw_last_result = self.dtw_analyzer.evaluate_technique()
+                self.sys_logger.log(
+                    "User execution evaluated.", str(self.dtw_last_result)
+                )
+            self.recording_state = REC_IDLE
+            self._recording_geometry_mode = None
         elif cmd == "SAVE_GOLDEN":
+            success = self.dtw_analyzer.save_golden_standard(self.exercise)
             self.sys_logger.log(
-                "Saving Trainer reference...", "Serializing golden reference to JSON."
+                "Golden Standard saved." if success else "No Golden Standard to save."
             )
-            self.dtw_analyzer.save_golden_standard(exercise=self.exercise)
         elif cmd == "LOAD_GOLDEN":
-            self.sys_logger.log(
-                "Loading Trainer reference...",
-                f"Deserializing golden reference from disk (exercise={self.exercise}).",
+            success = self.dtw_analyzer.load_golden_standard_from_file(self.exercise)
+            self._golden_geometry_mode = self.dtw_analyzer.reference_metadata.get(
+                "reconstruction_mode"
             )
-            self.dtw_analyzer.load_golden_standard_from_file(exercise=self.exercise)
+            self.sys_logger.log(
+                "Golden Standard loaded."
+                if success
+                else "Golden Standard not found or incompatible."
+            )
+        elif cmd == "DELETE_GOLDEN":
+            success = self.dtw_analyzer.delete_golden_standard_file(self.exercise)
+            self.sys_logger.log(
+                "Golden Standard deleted."
+                if success
+                else "No Golden Standard file found."
+            )
         elif cmd == "VIEW_STATUS":
             self.sys_logger.log(
-                "Printing system status to console.",
-                "VIEW_STATUS requested. Dumping metrics to stdout.",
+                f"Mode={self.current_state}; calibration={self.camera_is_calibrated}; reconstruction={self._last_reconstruction_mode}; recording={self.recording_state}"
             )
-            print("\n📊 --- AURA STATUS REPORT ---")
-            print(f"Target Exercise: {self.exercise}")
-        elif cmd == "DELETE_GOLDEN":
-            self.sys_logger.log(
-                "Deleted Trainer reference.",
-                "Unlinking golden reference JSON from disk.",
-            )
-            self.dtw_analyzer.delete_golden_standard_file(exercise=self.exercise)
-
         return True
 
     def shutdown(self) -> None:
-        self.cap.release()
+        """Release camera, MediaPipe instances, and OpenCV windows safely."""
+        if getattr(self, "multi_detector", None) is not None:
+            self.multi_detector.close()
+            self.multi_detector = None
+        if getattr(self, "single_detector", None) is not None:
+            self.single_detector.close()
+        if getattr(self, "cap", None) is not None:
+            self.cap.release()
         cv2.destroyAllWindows()

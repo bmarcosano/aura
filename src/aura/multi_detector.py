@@ -1,172 +1,130 @@
-"""
-multi_detector.py: Manages dual-view frame splitting, parallel 2D pose detection,
-and absolute metric anthropometric validation.
-"""
+"""Two-ROI pose inference for the direct and mirror-reflected image regions."""
 
 from __future__ import annotations
 
-import cv2
+import logging
+
 import numpy as np
 
+from aura.anthropometry import AnthropometricValidator  # Legacy import path.
 from aura.detector import PoseDetector
 
-
-class AnthropometricValidator:
-    """
-    Validates the reconstructed 3D skeleton using absolute metric bone lengths
-    (in meters or millimeters) rather than relative isometry.
-    """
-
-    def __init__(self, units: str = "meters") -> None:
-        """
-        Initializes the validator with real-world metric thresholds.
-
-        Args:
-            units: 'meters' or 'millimeters' based on ArUco calibration.
-        """
-        self.scale = 1.0 if units == "meters" else 1000.0
-
-        # Standard human bone length thresholds (min, max) in meters
-        self.thresholds = {
-            "shoulder_width": (0.25, 0.60),
-            "femur": (0.35, 0.65),
-            "tibia": (0.30, 0.55),
-            "torso": (0.40, 0.80),
-        }
-
-        # Scale thresholds based on the selected unit of measurement
-        self.thresholds = {
-            k: (v[0] * self.scale, v[1] * self.scale)
-            for k, v in self.thresholds.items()
-        }
-
-    def validate_skeleton_3d(self, landmarks_3d: np.ndarray) -> bool:
-        """
-        Validates the reconstructed 3D skeleton using metric bone lengths.
-
-        Args:
-            landmarks_3d: Nx3 numpy array of reconstructed points (from StereoReconstructor).
-
-        Returns:
-            Boolean indicating if the skeleton is anthropometrically valid.
-        """
-        try:
-            # Calculate absolute metric distances using L2 norm
-            shoulder_w = np.linalg.norm(landmarks_3d[11] - landmarks_3d[12])
-            left_femur = np.linalg.norm(landmarks_3d[23] - landmarks_3d[25])
-            left_tibia = np.linalg.norm(landmarks_3d[25] - landmarks_3d[27])
-            torso = np.linalg.norm(
-                (landmarks_3d[11] + landmarks_3d[12]) / 2.0
-                - (landmarks_3d[23] + landmarks_3d[24]) / 2.0
-            )
-
-            # Validate structural integrity against anatomical thresholds
-            valid = (
-                self.thresholds["shoulder_width"][0]
-                <= shoulder_w
-                <= self.thresholds["shoulder_width"][1]
-                and self.thresholds["femur"][0]
-                <= left_femur
-                <= self.thresholds["femur"][1]
-                and self.thresholds["tibia"][0]
-                <= left_tibia
-                <= self.thresholds["tibia"][1]
-                and self.thresholds["torso"][0] <= torso <= self.thresholds["torso"][1]
-            )
-            return bool(valid)
-
-        except IndexError:
-            return False
+logger = logging.getLogger(__name__)
 
 
 class MultiSkeletonDetector:
-    """
-    Splits a dual-view frame and runs MediaPipe detection to extract 2D pixel landmarks
-    for the direct and reflected views, passing them to the Engine for stereo triangulation.
+    """Run two independent PoseDetectors and map both outputs to full-frame pixels.
+
+    The left region is treated as the direct view and the right region as the
+    mirror view. The mirror ROI is horizontally flipped only for pose inference;
+    its landmarks are then unflipped and translated back to the original frame.
+    The split ratio must be supplied by a reliable/assisted splitter.
     """
 
     def __init__(self, split_ratio: float = 0.5) -> None:
-        self.split_ratio = split_ratio
-
+        if not 0.05 <= float(split_ratio) <= 0.95:
+            raise ValueError("split_ratio must be between 0.05 and 0.95")
+        self.split_ratio = float(split_ratio)
         self.front_detector = PoseDetector()
         self.mirror_detector = PoseDetector()
+        self.validator = AnthropometricValidator(units="meters")
+        self.last_frame_size: tuple[int, int] | None = None
 
     def _crop_rois(self, frame: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        _, _w, _ = frame.shape
-        split_x = int(_w * self.split_ratio)
-        return frame[:, :split_x], frame[:, split_x:]
+        """Split a BGR frame into non-empty left/direct and right/mirror ROIs."""
+        if frame is None or frame.ndim != 3 or frame.size == 0:
+            raise ValueError("frame must be a non-empty BGR image")
+        _height, width = frame.shape[:2]
+        split_x = round(width * self.split_ratio)
+        split_x = min(max(split_x, 1), width - 1)
+        return frame[:, :split_x].copy(), frame[:, split_x:].copy()
+
+    @staticmethod
+    def map_mirror_pixels_to_full_frame(
+        flipped_roi_points: np.ndarray, roi_width: int, split_x: int
+    ) -> np.ndarray:
+        """Undo ROI flip and restore the crop offset to full-frame pixel coordinates."""
+        points = np.asarray(flipped_roi_points, dtype=np.float64).copy()
+        if points.ndim != 2 or points.shape[1] != 2:
+            raise ValueError("flipped_roi_points must have shape (N,2)")
+        if roi_width < 1 or split_x < 0:
+            raise ValueError("Invalid ROI geometry")
+        points[:, 0] = (roi_width - 1) - points[:, 0] + split_x
+        return points
 
     def _get_2d_pixels(self, detector: PoseDetector) -> np.ndarray | None:
-        """Extracts normalized 2D coordinates (x, y) from the detector."""
-        results = getattr(detector, "results", None)
-        if not results or not getattr(results, "pose_landmarks", None):
+        """Return the detector's most recent image-pixel landmark array."""
+        if detector._last_image_size is None:
             return None
-
-        landmarks_2d = []
-        for lm in results.pose_landmarks.landmark:
-            landmarks_2d.append([lm.x, lm.y])
-
-        return np.array(landmarks_2d, dtype=np.float32)
+        width, height = detector._last_image_size
+        return detector.get_landmark_array(width, height)
 
     def process_frame(self, frame: np.ndarray) -> dict:
-        """
-        Processes the frame to extract 2D bounding boxes and normalized 2D landmarks,
-        mapping them back to the absolute camera coordinate system.
-        """
-        logs = []
-        h, _w, _ = frame.shape
-        split_x = int(_w * self.split_ratio)
-
+        """Infer both ROIs and return legacy keys plus explicit geometry metadata."""
         front_roi, mirror_roi = self._crop_rois(frame)
-        flipped_mirror_roi = cv2.flip(mirror_roi, 1)
+        height, full_width = frame.shape[:2]
+        split_x = front_roi.shape[1]
+        mirror_inference_roi = np.ascontiguousarray(mirror_roi[:, ::-1])
 
-        logs.append(
-            (
-                "Running MediaPipe Pose detection on dual camera feeds.",
-                f"MediaPipe inference dispatched for Front ROI ({front_roi.shape}) and Flipped Mirror ROI ({flipped_mirror_roi.shape}).",
+        front_raw = self.front_detector.detect(front_roi, draw=True)
+        mirror_raw = self.mirror_detector.detect(mirror_inference_roi, draw=True)
+        front_results = self.front_detector.results
+        mirror_results = self.mirror_detector.results
+
+        direct_2d = None
+        reflected_2d = None
+        direct_visibility = None
+        reflected_visibility = None
+        if front_raw is not None:
+            direct_2d = front_raw[:, :2].astype(np.float64)
+            direct_visibility = front_raw[:, 3].astype(np.float32)
+            # The direct ROI starts at x=0, so local and full-frame X match.
+        if mirror_raw is not None:
+            # Convert from flipped ROI pixels to original full-frame pixels.
+            reflected_2d = self.map_mirror_pixels_to_full_frame(
+                mirror_raw[:, :2], mirror_roi.shape[1], split_x
             )
+            reflected_visibility = mirror_raw[:, 3].astype(np.float32)
+
+        # A valid pair means only that usable observations exist; it does not
+        # assert that the mirror plane or 3D reconstruction has been validated.
+        is_valid = bool(
+            direct_2d is not None
+            and reflected_2d is not None
+            and direct_2d.shape == reflected_2d.shape == (33, 2)
+            and np.isfinite(direct_2d).all()
+            and np.isfinite(reflected_2d).all()
+            and int(np.sum(direct_visibility >= 0.35)) >= 12
+            and int(np.sum(reflected_visibility >= 0.35)) >= 12
         )
 
-        self.front_detector.detect(front_roi, draw=True)
-        self.mirror_detector.detect(flipped_mirror_roi, draw=True)
-
-        front_results = getattr(self.front_detector, "results", None)
-        mirror_results = getattr(self.mirror_detector, "results", None)
-
-        annotated_mirror_roi = cv2.flip(flipped_mirror_roi, 1)
-
-        # Retrieve normalized coordinates (0.0 to 1.0)
-        front_2d = self._get_2d_pixels(self.front_detector)
-        mirror_2d = self._get_2d_pixels(self.mirror_detector)
-
-        if front_2d is not None:
-            # Direct view: scale to pixels. X is already correct relative to the left edge of the original frame.
-            front_2d[:, 0] *= front_roi.shape[1]
-            front_2d[:, 1] *= h
-
-        if mirror_2d is not None:
-            w_roi = flipped_mirror_roi.shape[1]
-
-            # 1. Scale normalized coordinates to the flipped ROI pixel dimensions
-            mirror_2d[:, 0] *= w_roi
-            mirror_2d[:, 1] *= h
-
-            # 2. Revert the horizontal flip to get coordinates matching the original mirror ROI
-            mirror_2d[:, 0] = (w_roi - 1) - mirror_2d[:, 0]
-
-            # 3. Translate the X coordinates to the full absolute camera coordinate system
-            mirror_2d[:, 0] += split_x
-
-        # Default to True to satisfy default FSM state requirements when detection is mocked
-        is_valid = True
-
+        logs: list[tuple[str, str]] = []
+        if not is_valid:
+            logs.append(
+                (
+                    "Both views are not currently reliable.",
+                    "ROI observations missing or too many low-visibility landmarks.",
+                )
+            )
         return {
             "front_roi": front_roi,
-            "mirror_roi": annotated_mirror_roi,
+            "mirror_roi": mirror_roi,
             "front_results": front_results,
             "mirror_results": mirror_results,
-            "direct_pose_2d": front_2d,
-            "reflected_pose_2d": mirror_2d,
+            "direct_pose_2d": direct_2d,
+            "reflected_pose_2d": reflected_2d,
+            "direct_visibility": direct_visibility,
+            "reflected_visibility": reflected_visibility,
+            "split_x": split_x,
+            "frame_size": (full_width, height),
             "is_valid": is_valid,
             "logs": logs,
         }
+
+    def close(self) -> None:
+        """Release both MediaPipe graphs."""
+        self.front_detector.close()
+        self.mirror_detector.close()
+
+
+__all__ = ["AnthropometricValidator", "MultiSkeletonDetector"]

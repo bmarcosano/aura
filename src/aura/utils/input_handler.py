@@ -1,6 +1,4 @@
-"""
-input_handler.py: Keypress controller and command mapper for AURA.
-"""
+"""Keyboard command mapping for the AURA OpenCV interface."""
 
 from __future__ import annotations
 
@@ -10,7 +8,7 @@ import cv2
 
 
 class KeyboardController:
-    """Maps raw keyboard inputs to AURA FSM commands."""
+    """Map keyboard events to stable command names."""
 
     COMMAND_MAP: ClassVar[dict[int, str]] = {
         ord("g"): "REC_GOLDEN",
@@ -31,20 +29,14 @@ class KeyboardController:
         ord("Q"): "QUIT",
         ord("m"): "TOGGLE_LOG_MODE",
         ord("M"): "TOGGLE_LOG_MODE",
+        ord("x"): "TOGGLE_MIRROR",
+        ord("X"): "TOGGLE_MIRROR",
     }
 
     @classmethod
     def get_command(cls, delay: int = 33) -> tuple[str, int]:
-        """
-        Polls OpenCV keypress. Returns (command_name, raw_key_code).
-        Uses waitKeyEx to properly capture extended keys (like Arrows).
-        """
+        """Return (command, raw OpenCV key code); preserve the legacy signature."""
         raw_key = cv2.waitKeyEx(delay)
         if raw_key == -1:
             return "NONE", -1
-
-        # Extract lower byte for standard ASCII matching if it's a standard key
-        char_key = raw_key & 0xFF
-        cmd = cls.COMMAND_MAP.get(char_key, "NONE")
-
-        return cmd, raw_key
+        return cls.COMMAND_MAP.get(raw_key & 0xFF, "NONE"), raw_key
