@@ -1,10 +1,9 @@
 """
-Module for Temporal Biomechanical Analysis using Dynamic Time Warping (DTW).
+Module for Temporal Biomechanical Analysis using Multidimensional Dynamic Time Warping (DTW).
 
-This module analyzes the execution of a movement over time (a trajectory),
-comparing a user's performance against a pre-recorded "Golden Standard" (e.g., a trainer).
-It uses the fastdtw algorithm to align the sequences elastically.
-It also supports saving, loading, and managing the Golden Standard to/from a JSON file.
+This module analyzes movement execution over time by extracting 3D joint angles
+from reconstructed skeletal landmarks and comparing the live sequence against a pre-recorded
+"Golden Standard" (e.g., a trainer). It supports JSON persistence for multi-feature trajectories.
 """
 
 from __future__ import annotations
@@ -13,26 +12,79 @@ import json
 import os
 
 import numpy as np
-from fastdtw import fastdtw
-from scipy.spatial.distance import euclidean
+from scipy.spatial.distance import cdist
 
 
 class DTWTemporalAnalyzer:
-    def __init__(self, sensitivity: float = 5.0):
+    """
+    Analyzes temporal execution of movement using multidimensional 3D kinematic feature vectors
+    (e.g., knee and elbow angles) and Dynamic Time Warping (DTW).
+    """
+
+    def __init__(self, sensitivity: float = 5.0) -> None:
         """
         Initializes the Temporal Analyzer.
 
-        :param sensitivity: Determines how strictly the score drops as the DTW distance increases.
+        Args:
+            sensitivity: Scale factor for scoring penalty as DTW distance increases.
         """
-        self.golden_reference: list[float] = []
-        self.user_buffer: list[float] = []
+        self.golden_reference: list = []  # Time x Features or Time x 1
+        self.user_buffer: list = []  # Time x Features or Time x 1
         self.sensitivity = sensitivity
 
-    def load_golden_standard(self, trajectory: list[float]) -> None:
-        """Loads the ideal movement execution array directly from memory."""
-        if not trajectory:
+    def _compute_angle_3d(self, a: np.ndarray, b: np.ndarray, c: np.ndarray) -> float:
+        """
+        Computes the 3D angle (in degrees) between three 3D points (a, b, c) with b as the vertex.
+        """
+        ba = a - b
+        bc = c - b
+
+        norm_ba = np.linalg.norm(ba)
+        norm_bc = np.linalg.norm(bc)
+
+        if norm_ba < 1e-6 or norm_bc < 1e-6:
+            return 0.0
+
+        cosine_angle = np.dot(ba, bc) / (norm_ba * norm_bc)
+        cosine_angle = np.clip(cosine_angle, -1.0, 1.0)
+
+        return float(np.degrees(np.arccos(cosine_angle)))
+
+    def extract_kinematic_features(self, landmarks_3d: np.ndarray) -> np.ndarray:
+        """
+        Extracts key biomechanical joint angles (knee & elbow 3D angles) from a 3D skeleton.
+        Returns a 4-dimensional feature vector.
+        """
+        try:
+            left_knee = self._compute_angle_3d(
+                landmarks_3d[23], landmarks_3d[25], landmarks_3d[27]
+            )
+            right_knee = self._compute_angle_3d(
+                landmarks_3d[24], landmarks_3d[26], landmarks_3d[28]
+            )
+            left_elbow = self._compute_angle_3d(
+                landmarks_3d[11], landmarks_3d[13], landmarks_3d[15]
+            )
+            right_elbow = self._compute_angle_3d(
+                landmarks_3d[12], landmarks_3d[14], landmarks_3d[16]
+            )
+
+            return np.array(
+                [left_knee, right_knee, left_elbow, right_elbow], dtype=np.float32
+            )
+        except (IndexError, TypeError):
+            return np.zeros(4, dtype=np.float32)
+
+    def load_golden_standard(self, trajectory: list | np.ndarray) -> None:
+        """Loads the ideal movement execution feature matrix directly from memory."""
+        if trajectory is None or len(trajectory) == 0:
             raise ValueError("Golden standard trajectory cannot be empty.")
-        self.golden_reference = trajectory
+
+        if isinstance(trajectory, np.ndarray):
+            self.golden_reference = trajectory.tolist()
+        else:
+            self.golden_reference = list(trajectory)
+
         print(
             f"✅ Golden Standard loaded in memory ({len(self.golden_reference)} frames)."
         )
@@ -45,8 +97,7 @@ class DTWTemporalAnalyzer:
         self, exercise: str = "squats", filename: str = "golden.json"
     ) -> bool:
         """
-        Saves the currently recorded Golden Standard to a structured exercise directory
-        under golden_executions/<exercise>/<filename>.
+        Saves the currently recorded Golden Standard to a structured exercise directory.
         """
         if not self.golden_reference:
             print("⚠️ Error: No Golden Standard in memory to save.")
@@ -70,7 +121,10 @@ class DTWTemporalAnalyzer:
     def load_golden_standard_from_file(
         self, exercise: str = "squats", filename: str = "golden.json"
     ) -> bool:
-        """Loads a previously saved Golden Standard from golden_executions/<exercise>/<filename>."""
+        """
+        Loads a previously saved Golden Standard from golden_executions/<exercise>/<filename>.
+        Includes backward compatibility checks to prevent crashes with legacy 1D (scalar) recordings.
+        """
         filepath = os.path.join("golden_executions", exercise, filename)
 
         if not os.path.exists(filepath):
@@ -82,7 +136,17 @@ class DTWTemporalAnalyzer:
                 data = json.load(f)
 
             if "golden_reference" in data:
-                self.golden_reference = data["golden_reference"]
+                ref_data = np.array(data["golden_reference"])
+
+                # CRITICAL FIX: Block legacy 1D scalar recordings from crashing scipy.cdist
+                if ref_data.ndim == 1:
+                    print(
+                        "⚠️ WARNING: Found legacy Golden Standard (scalar). Incompatible with new 4-angle vectors."
+                    )
+                    self.golden_reference = []
+                    return False
+
+                self.golden_reference = ref_data.tolist()
                 print(
                     f"📂 Loaded successfully: {filepath} ({len(self.golden_reference)} frames)."
                 )
@@ -116,9 +180,16 @@ class DTWTemporalAnalyzer:
     # USER BUFFER & EVALUATION
     # ==========================================
 
-    def add_user_frame(self, metric_value: float) -> None:
-        """Appends a real-time biomechanical metric to the user buffer."""
-        self.user_buffer.append(metric_value)
+    def add_user_frame(self, frame_features: np.ndarray | list[float] | float) -> None:
+        """
+        Appends a real-time biomechanical feature vector (or scalar) to the user buffer.
+        """
+        if isinstance(frame_features, np.ndarray):
+            self.user_buffer.append(frame_features.tolist())
+        elif isinstance(frame_features, (list, tuple)):
+            self.user_buffer.append(list(frame_features))
+        else:
+            self.user_buffer.append(float(frame_features))
 
     def reset_user_buffer(self) -> None:
         """Clears the user buffer to prepare for the next repetition."""
@@ -144,19 +215,72 @@ class DTWTemporalAnalyzer:
             return "PACE: OPTIMAL"
 
     def evaluate_technique(self) -> dict:
-        """Warp-aligns the user's buffer against the Golden Standard using FastDTW."""
+        """
+        Warp-aligns the user's feature buffer against the Golden Standard using
+        multidimensional Dynamic Time Warping (DTW).
+
+        Returns:
+            Dictionary containing evaluation status, score, raw distance, and feedback.
+        """
         if not self.golden_reference:
-            return {"error": "No Golden Standard loaded.", "score": 0}
+            return {
+                "error": "No Golden Standard loaded.",
+                "score": 0,
+                "raw_distance": 0.0,
+            }
 
         if len(self.user_buffer) < 5:
-            return {"error": "User movement too short for analysis.", "score": 0}
+            return {
+                "error": "User movement too short for analysis.",
+                "score": 0,
+                "raw_distance": 0.0,
+            }
 
-        ref_arr = np.array(self.golden_reference).reshape(-1, 1)
-        user_arr = np.array(self.user_buffer).reshape(-1, 1)
+        seq1 = np.asarray(self.user_buffer, dtype=np.float32)
+        seq2 = np.asarray(self.golden_reference, dtype=np.float32)
 
-        raw_distance, path = fastdtw(ref_arr, user_arr, dist=euclidean)
+        if seq1.ndim == 1:
+            seq1 = seq1.reshape(-1, 1)
+        if seq2.ndim == 1:
+            seq2 = seq2.reshape(-1, 1)
 
-        avg_deviation = raw_distance / len(path)
+        dist_matrix = cdist(seq1, seq2, metric="euclidean")
+
+        T, K = dist_matrix.shape
+        cost_matrix = np.full((T + 1, K + 1), float("inf"))
+        cost_matrix[0, 0] = 0.0
+
+        for i in range(1, T + 1):
+            for j in range(1, K + 1):
+                cost = dist_matrix[i - 1, j - 1]
+                cost_matrix[i, j] = cost + min(
+                    cost_matrix[i - 1, j],  # insertion
+                    cost_matrix[i, j - 1],  # deletion
+                    cost_matrix[i - 1, j - 1],  # match
+                )
+
+        raw_distance = cost_matrix[T, K]
+
+        # Backtrack optimal warping path to find exact path length
+        i, j = T, K
+        path_len = 0
+        while i > 0 and j > 0:
+            path_len += 1
+            c_match = cost_matrix[i - 1, j - 1]
+            c_ins = cost_matrix[i - 1, j]
+            c_del = cost_matrix[i, j - 1]
+            m = min(c_match, c_ins, c_del)
+            if m == c_match:
+                i -= 1
+                j -= 1
+            elif m == c_ins:
+                i -= 1
+            else:
+                j -= 1
+        path_len += i + j
+
+        avg_deviation = raw_distance / max(1, path_len)
+
         raw_score = 100.0 - (avg_deviation * self.sensitivity)
         final_score = max(0.0, min(100.0, raw_score))
 
@@ -169,10 +293,12 @@ class DTWTemporalAnalyzer:
         else:
             feedback = "POOR - Biomechanical risk"
 
+        # CRITICAL FIX: raw_distance added to return dict to prevent Engine errors
         return {
             "status": "SUCCESS",
-            "score": round(final_score, 1),
-            "deviation_per_frame": round(avg_deviation, 3),
+            "score": round(float(final_score), 1),
+            "raw_distance": float(raw_distance),
+            "deviation_per_frame": round(float(avg_deviation), 3),
             "feedback": feedback,
             "frames_analyzed": len(self.user_buffer),
         }
