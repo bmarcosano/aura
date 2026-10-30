@@ -43,7 +43,7 @@ class StereoReconstructor:
         pt2d_direct: np.ndarray,
         pt2d_reflected: np.ndarray,
         P2: np.ndarray,
-        max_error_px: float = 50.0,
+        max_error_px: float = 15.0,
     ) -> bool:
         """
         Verifies how well a triangulated 3D point matches the original 2D observations.
@@ -119,18 +119,18 @@ class StereoReconstructor:
         W = points_4d_hom[3, :] + 1e-7
         points_3d = (points_4d_hom[:3, :] / W).T
 
-        # 6. Reprojection Check Pipeline
-        # Only log severe geometric mismatches (error > 50px) to accommodate uncalibrated/synthetic video
+        # 6. Reprojection Check Pipeline (Optional flagging/smoothing can be implemented here)
+        # For now, we compute it to log severe geometric mismatches
         valid_points_count = 0
         for i in range(len(points_3d)):
             if self._check_reprojection_error(
-                points_3d[i], pts1[i], pts2[i], P2, max_error_px=50.0
+                points_3d[i], pts1[i], pts2[i], P2, max_error_px=15.0
             ):
                 valid_points_count += 1
 
-        if valid_points_count < len(points_3d) * 0.3:  # Lowered threshold to 30%
-            logger.debug(
-                f"Low reconstruction quality: only {valid_points_count}/{len(points_3d)} points passed strict reprojection."
+        if valid_points_count < len(points_3d) * 0.5:
+            logger.warning(
+                f"Low reconstruction quality: only {valid_points_count}/{len(points_3d)} points passed reprojection check."
             )
 
         # 7. Return as an Nx3 array to match standard landmark shapes

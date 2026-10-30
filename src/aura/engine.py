@@ -2,7 +2,7 @@
 engine.py: Core application loop and state management for AURA.
 Includes multi-marker ArUco tracking for absolute spatial anchoring,
 Markerless SVD Fallback, dynamic floor grounding, Auto Splitter UI window,
-and unified 3D Digital Twin rendering.
+and unified 3D Digital Twin.
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ import numpy as np
 from aura.analyzer import PostureAnalyzer
 from aura.detector import PoseDetector
 from aura.logger import AuraLogger
-from aura.mirror_plane import MirrorPlaneEstimator
+from aura.mirror_plane import MirrorPlaneEstimator  # Imported the new math estimator
 
 # New Refactored Modules
 from aura.multi_detector import AnthropometricValidator, MultiSkeletonDetector
@@ -63,38 +63,34 @@ class AuraEngine:
         self.dist_coeffs = None
         self.apply_calibration = False
 
-        loaded_camera_matrix = None
-        loaded_dist_coeffs = None
         calib_path = "camera_calibration.npz"
-
         if os.path.exists(calib_path):
             with np.load(calib_path) as data:
                 loaded_camera_matrix = data["camera_matrix"]
                 loaded_dist_coeffs = data["dist_coeffs"]
 
-        if isinstance(self.source, int):
-            # Physical webcam: default to applying calibration if available
-            if loaded_camera_matrix is not None:
-                self.apply_calibration = True
-                self.camera_matrix = loaded_camera_matrix
-                self.dist_coeffs = loaded_dist_coeffs
-        else:
-            # Video file: prompt the user, as the physical lens might not match the video
-            print(f"\n[INFO] Video source detected: {self.source}")
-            ans = (
-                input("Apply optical calibration (undistort)? [y/N]: ").strip().lower()
-            )
-            if ans == "y" and loaded_camera_matrix is not None:
+            if isinstance(self.source, int):
                 self.apply_calibration = True
                 self.camera_matrix = loaded_camera_matrix
                 self.dist_coeffs = loaded_dist_coeffs
             else:
-                self.apply_calibration = False
+                print(f"\n[INFO] Video source detected: {self.source}")
+                ans = (
+                    input("Apply optical calibration (undistort)? [y/N]: ")
+                    .strip()
+                    .lower()
+                )
+                if ans == "y":
+                    self.apply_calibration = True
+                    self.camera_matrix = loaded_camera_matrix
+                    self.dist_coeffs = loaded_dist_coeffs
+                else:
+                    self.apply_calibration = False
 
-        # Fallback: Generate a generic pinhole camera matrix for synthetic or uncalibrated video
-        # This prevents solvePnP and triangulation from failing due to mismatched focal lengths.
+        # Fallback: Generate a generic pinhole camera matrix for uncalibrated/synthetic video
         if self.camera_matrix is None:
-            focal_length = float(frame_width)
+            # Approximate focal length for a standard ~60 degree FOV camera
+            focal_length = frame_width
             self.camera_matrix = np.array(
                 [
                     [focal_length, 0, frame_width / 2.0],
@@ -105,7 +101,7 @@ class AuraEngine:
             )
             self.dist_coeffs = np.zeros((4, 1), dtype=np.float32)
             print(
-                f"[INFO] Using generic pinhole camera matrix (Focal length: {focal_length}).\n"
+                f"[INFO] Using generic pinhole camera matrix (Focal: {focal_length}).\n"
             )
 
         # Initialize ArUco tracker (marker size accurately set to 18cm = 0.18m)
@@ -118,7 +114,7 @@ class AuraEngine:
         self.splitter = AutoROISplitter()
         self.multi_detector: MultiSkeletonDetector | None = None
 
-        # Structural Subsystems
+        # New Structural Subsystems
         self.reconstructor: StereoReconstructor | None = None
         if self.camera_matrix is not None:
             self.reconstructor = StereoReconstructor(self.camera_matrix)
@@ -132,7 +128,7 @@ class AuraEngine:
         self.viewer_3d = Aura3DViewer(width=800, height=600)
         self.sys_logger = AuraLogger()
 
-        # Silent Split setup (Temporal coherence validation)
+        # Silent Split setup
         mp_pose = mp.solutions.pose
         self.silent_checker_left = mp_pose.Pose(min_detection_confidence=0.5)
         self.silent_checker_right = mp_pose.Pose(min_detection_confidence=0.5)
@@ -148,9 +144,10 @@ class AuraEngine:
 
     def _ground_landmarks(self, landmarks_3d: np.ndarray | None) -> np.ndarray | None:
         """
-        Dynamically grounds raw 3D world landmarks onto the floor grid (Y=0) every frame.
-        Finds the absolute lowest point of the feet and forces it to Y=0, absorbing
-        the squat dynamically without vertical floating.
+        Dynamically grounds raw MediaPipe 3D world landmarks onto the floor grid (Y=0) EVERY FRAME.
+        MediaPipe world_landmarks are inherently hip-centered. By calculating the feet centroid
+        dynamically and applying it instantly (without EMA lag), the feet stay perfectly glued
+        to the floor, absorbing the squat naturally without vertical floating or lateral skating.
         """
         if landmarks_3d is None or len(landmarks_3d) != 33:
             return landmarks_3d
@@ -158,12 +155,12 @@ class AuraEngine:
         grounded = landmarks_3d.copy()
         feet_indices = [27, 28, 29, 30, 31, 32]  # Ankles, heels, toes
 
-        # Use np.max for Y to guarantee the lowest physical point touches the floor
+        # Use np.max for Y to guarantee the absolute lowest physical point touches the floor
         target_y = float(np.max(grounded[feet_indices, 1]))
         target_x = float((grounded[27, 0] + grounded[28, 0]) / 2.0)
         target_z = float((grounded[27, 2] + grounded[28, 2]) / 2.0)
 
-        # Instant subtraction locks the feet centroid at (X=0, Z=0) and height Y=0
+        # Instant subtraction: forces the feet to be locked at X=0, Z=0 and lowest point at Y=0
         grounded[:, 0] -= target_x
         grounded[:, 1] -= target_y
         grounded[:, 2] -= target_z
@@ -174,8 +171,8 @@ class AuraEngine:
         self, active_results, is_fused_valid: bool = True
     ) -> dict[int, str]:
         """
-        Evaluates 3D joint posture against biomechanical thresholds and temporal DTW,
-        returning a color mapping for the 3D viewport joints.
+        Evaluates 3D joint posture against biomechanical golden standards and returns a
+        color mapping for rendering joints in the 3D viewport.
         """
         joint_colors: dict[int, str] = {}
 
@@ -223,6 +220,7 @@ class AuraEngine:
             joint_colors[12] = "bad"
 
         if self.recording_state == REC_USER and self.dtw_last_result:
+            # Handle both Tuple and Dict returns gracefully for temporal.py compatibility
             distance = 0.0
             if isinstance(self.dtw_last_result, dict):
                 distance = self.dtw_last_result.get("deviation_per_frame", 0)
@@ -232,7 +230,7 @@ class AuraEngine:
             ):
                 distance = self.dtw_last_result[0]
 
-            if distance > 1.5:
+            if distance > 1.5:  # Adjusted for multidimensional feature vectors
                 joint_colors[27] = "warning"
                 joint_colors[28] = "warning"
 
@@ -275,14 +273,14 @@ class AuraEngine:
 
             # --- PHASE 1: OPTICAL CORRECTION AND ARUCO TRACKING ---
             aruco_poses = {}
-            active_dist_coeffs = np.zeros((4, 1), dtype=np.float32)
-
             if self.camera_matrix is not None and self.dist_coeffs is not None:
                 if self.apply_calibration:
-                    # Physically undistort the frame using calibration data
                     frame = cv2.undistort(frame, self.camera_matrix, self.dist_coeffs)
+                    # CRITICAL FIX: The frame is now physically undistorted.
+                    # We must pass zeroed distortion coefficients to the ArUco tracker
+                    # to prevent it from double-applying the distortion mathematically.
+                    active_dist_coeffs = np.zeros((4, 1), dtype=np.float32)
                 else:
-                    # Frame remains distorted, pass native coefficients for tracking math
                     active_dist_coeffs = self.dist_coeffs
 
                 frame, aruco_poses = self.aruco_tracker.process_frame(
@@ -311,6 +309,7 @@ class AuraEngine:
             fused_3d = None
             plane_normal = None
 
+            # State flags for the current frame
             is_stereo_validated = False
             hud_status = "3D FUSION: SINGLE"
 
@@ -324,6 +323,7 @@ class AuraEngine:
                 self.single_detector.detect(display_frame, draw=True)
                 active_results = getattr(self.single_detector, "results", None)
 
+                # Ground raw single-view 3D landmarks onto floor Y=0 dynamically
                 raw_landmarks = self.single_detector.get_world_landmark_array()
                 fused_3d = self._ground_landmarks(raw_landmarks)
 
@@ -358,7 +358,7 @@ class AuraEngine:
                         fused_3d = self._ground_landmarks(raw_landmarks)
                         active_frame = frame
                 else:
-                    # 1. Extract 2D Pixel Landmarks
+                    # 1. Get 2D Pixel Landmarks
                     pipeline_data = self.multi_detector.process_frame(frame)
 
                     for user_msg, expert_msg in pipeline_data.get("logs", []):
@@ -381,12 +381,8 @@ class AuraEngine:
                         and reflected_pose_2d is not None
                         and self.reconstructor is not None
                     ):
-                        direct_3d_local = self.multi_detector.front_detector.get_world_landmark_array()
-                        reflected_3d_local = self.multi_detector.mirror_detector.get_world_landmark_array()
-
-                        # --- PLANE ESTIMATION ---
                         if aruco_rvec is not None and aruco_tvec is not None:
-                            # Mode 1: Exact ArUco Tracker Metric Plane (Physical Setup)
+                            # Mode 1: Exact ArUco Tracker Metric Plane
                             mirror_data = self.aruco_tracker.estimate_mirror_plane(
                                 aruco_rvec, aruco_tvec
                             )
@@ -394,38 +390,69 @@ class AuraEngine:
                             plane_normal = mirror_data["normal"]
                             hud_status = "3D FUSION: STEREO (ARUCO)"
                         else:
-                            # Mode 2: SVD Markerless Fallback (Synthetic/Uncalibrated Video)
+                            # Mode 2: SVD Markerless Fallback
+                            direct_3d_local = self.multi_detector.front_detector.get_world_landmark_array()
+                            reflected_3d_local = self.multi_detector.mirror_detector.get_world_landmark_array()
+
                             if (
                                 direct_3d_local is not None
                                 and reflected_3d_local is not None
                             ):
-                                # In synthetic video, MediaPipe's world landmarks are usually upright.
-                                # We revert the mirror's horizontal flip to restore spatial symmetry
+                                # 1. Flip the reflected 3D landmarks to match the direct view's coordinate system
                                 reflected_3d_unflipped = reflected_3d_local.copy()
                                 reflected_3d_unflipped[:, 0] *= -1
 
-                                # Calculate the mirror plane directly from the relative 3D vectors
-                                # without attempting to project them into camera space via solvePnP
-                                reflection_matrix, plane_normal = (
-                                    self.svd_estimator.estimate_plane(
-                                        direct_3d_local, reflected_3d_unflipped
-                                    )
+                                # 2. SolvePnP to estimate camera poses for both views
+                                active_dist = np.zeros((4, 1), dtype=np.float32)
+                                if (
+                                    self.dist_coeffs is not None
+                                    and not self.apply_calibration
+                                ):
+                                    active_dist = self.dist_coeffs
+
+                                success1, rvec1, tvec1 = cv2.solvePnP(
+                                    direct_3d_local.astype(np.float32),
+                                    direct_pose_2d.astype(np.float32),
+                                    self.camera_matrix,
+                                    active_dist,
+                                    flags=cv2.SOLVEPNP_SQPNP,
+                                )
+                                success2, rvec2, tvec2 = cv2.solvePnP(
+                                    reflected_3d_unflipped.astype(np.float32),
+                                    reflected_pose_2d.astype(np.float32),
+                                    self.camera_matrix,
+                                    active_dist,
+                                    flags=cv2.SOLVEPNP_SQPNP,
                                 )
 
-                                # In purely uncalibrated scenarios, the SVD plane often rests at Z=0.
-                                # We add a small artificial depth (e.g., 2 meters) to the translation
-                                # vector so the triangulated points don't collapse into the camera lens.
-                                if reflection_matrix is not None:
-                                    reflection_matrix[2, 3] = 2.0
-                                    hud_status = "3D FUSION: STEREO (SVD)"
+                                if success1 and success2:
+                                    R1, _ = cv2.Rodrigues(rvec1)
+                                    R2, _ = cv2.Rodrigues(rvec2)
 
-                        # --- TRIANGULATION & CORRECTION ---
+                                    # 3. Transform the local landmarks to the absolute camera space
+                                    direct_3d_abs = (
+                                        R1 @ direct_3d_local.T
+                                    ).T + tvec1.reshape(1, 3)
+                                    reflected_3d_abs = (
+                                        R2 @ reflected_3d_unflipped.T
+                                    ).T + tvec2.reshape(1, 3)
+
+                                    # 4. Estimate the mirror plane using SVD on the absolute 3D landmarks
+                                    reflection_matrix, plane_normal = (
+                                        self.svd_estimator.estimate_plane(
+                                            direct_3d_abs, reflected_3d_abs
+                                        )
+                                    )
+                                    if reflection_matrix is not None:
+                                        hud_status = "3D FUSION: STEREO (SVD)"
+
+                        # Triangulate metric 3D landmarks if a plane was found
                         if reflection_matrix is not None:
                             raw_landmarks_3d = self.reconstructor.triangulate_landmarks(
                                 direct_pose_2d, reflected_pose_2d, reflection_matrix
                             )
 
-                            # Validate metric integrity against anatomical thresholds
+                            # Validate metric integrity against human anatomy
                             if self.validator.validate_skeleton_3d(raw_landmarks_3d):
                                 fused_3d = self._ground_landmarks(raw_landmarks_3d)
                                 is_stereo_validated = True
@@ -473,7 +500,7 @@ class AuraEngine:
             # ==========================================
             # Protect Golden Standard recordings from single-view relative estimations
             if fused_3d is not None:
-                if is_stereo_validated or self.current_state == STATE_SINGLE:
+                if is_stereo_validated:
                     kinematic_features = self.dtw_analyzer.extract_kinematic_features(
                         fused_3d
                     )
@@ -485,6 +512,7 @@ class AuraEngine:
                     elif self.recording_state == REC_USER:
                         self.dtw_analyzer.add_user_frame(kinematic_features)
                 else:
+                    # Prevent silent injection of non-metric frames into DTW
                     if self.recording_state in [REC_GOLDEN, REC_USER]:
                         self.sys_logger.log(
                             "Warning: Frame dropped from recording.",
@@ -517,10 +545,12 @@ class AuraEngine:
                 if self._is_valid_roi(mirror_roi):
                     cv2.imshow("AURA - Mirror View", mirror_roi)
 
+            # Evaluate biomechanical joint colors against golden standard
             joint_colors = self._evaluate_joint_colors(
                 active_results, is_stereo_validated
             )
 
+            # Render Single Unified 3D Viewport
             cv2.imshow(
                 "AURA - 3D Digital Twin & SVD Inspector",
                 self.viewer_3d.render_scene(fused_3d, plane_normal, joint_colors),
@@ -537,6 +567,7 @@ class AuraEngine:
             # ==========================================
             cmd, raw_key = KeyboardController.get_command(self.delay)
 
+            # Pass key to 3D Viewer orbit controls (handles Arrow keys & Numpad keys)
             if raw_key != -1:
                 self.viewer_3d.handle_keyboard(raw_key)
 
@@ -551,7 +582,6 @@ class AuraEngine:
         )
 
     def _check_silent_split(self, frame: np.ndarray, w: int) -> None:
-        """Evaluates Pearson correlation between the two halves to trigger the MIRROR_MODE."""
         if self.frame_count % 10 != 0:
             return
 
@@ -659,6 +689,7 @@ class AuraEngine:
                 if self.recording_state == REC_USER:
                     self.dtw_last_result = self.dtw_analyzer.evaluate_technique()
 
+                    # Handle Tuple or Dict return safely
                     raw_dist = 0.0
                     if isinstance(self.dtw_last_result, dict):
                         raw_dist = self.dtw_last_result.get("raw_distance", 0)
