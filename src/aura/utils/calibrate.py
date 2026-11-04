@@ -127,7 +127,11 @@ def calibrate_webcam(
 
             # Save calibration parameters to disk
             np.savez(
-                output_filename, camera_matrix=camera_matrix, dist_coeffs=dist_coeffs
+                output_filename,
+                camera_matrix=camera_matrix,
+                dist_coeffs=dist_coeffs,
+                image_width=int(gray_shape[0]),
+                image_height=int(gray_shape[1]),
             )
             print(f"💾 Parameters successfully saved to '{output_filename}'.")
         else:

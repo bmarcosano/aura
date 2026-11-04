@@ -87,9 +87,10 @@ class PoseDetector:
         return np.array(landmarks, dtype=np.float32)
 
     def get_world_landmark_array(self) -> np.ndarray | None:
-        """
-        Extracts real-world 3D coordinates (x, y, z in meters) with origin at the hip center.
-        Crucial for SVD mirror plane estimation and anthropometric validation.
+        """Return MediaPipe's per-view 3D pose estimate, hip-centred and in metres.
+
+        These are model-estimated body-relative coordinates, not absolute camera
+        coordinates and not a calibrated stereo reconstruction.
         """
         if not self.results or not self.results.pose_world_landmarks:
             return None
@@ -99,3 +100,45 @@ class PoseDetector:
             landmarks.append([lm.x, lm.y, lm.z])
 
         return np.array(landmarks, dtype=np.float32)
+
+    def get_visibility_array(self) -> np.ndarray | None:
+        """Return MediaPipe visibility for all 33 landmarks (legacy-compatible)."""
+        if not self.results or not self.results.pose_landmarks:
+            return None
+        values = [
+            float(getattr(lm, "visibility", 0.0))
+            for lm in self.results.pose_landmarks.landmark
+        ]
+        return np.clip(np.asarray(values, dtype=np.float32), 0.0, 1.0)
+
+    def get_presence_array(self) -> np.ndarray | None:
+        """Return MediaPipe presence where available, otherwise visibility.
+
+        MediaPipe versions differ in whether ``presence`` is exposed by the
+        normalized pose landmark object. Falling back to visibility keeps the
+        confidence contract stable across supported versions.
+        """
+        if not self.results or not self.results.pose_landmarks:
+            return None
+        landmarks = self.results.pose_landmarks.landmark
+        values = []
+        for lm in landmarks:
+            visibility = float(getattr(lm, "visibility", 0.0))
+            presence = None
+            has_field = getattr(lm, "HasField", None)
+            if callable(has_field):
+                try:
+                    if has_field("presence"):
+                        presence = float(lm.presence)
+                except (ValueError, TypeError):
+                    presence = None
+            else:
+                raw_presence = getattr(lm, "presence", None)
+                if raw_presence is not None:
+                    presence = float(raw_presence)
+            # Proto3 scalar fields can read as 0 when unset. If that happens
+            # while visibility is positive, use visibility as the fallback.
+            if presence is None or (presence <= 0.0 < visibility):
+                presence = visibility
+            values.append(presence)
+        return np.clip(np.asarray(values, dtype=np.float32), 0.0, 1.0)

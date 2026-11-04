@@ -1,14 +1,14 @@
 """
 engine.py: Core application loop and state management for AURA.
-Includes multi-marker ArUco tracking for absolute spatial anchoring,
-Markerless SVD Fallback, dynamic floor grounding, Auto Splitter UI window,
-and unified 3D Digital Twin.
+Includes automatic dual-view estimated fusion, optional calibrated ArUco
+metric reconstruction, automatic ROI splitting, and one unified 3D Digital Twin.
 """
 
 from __future__ import annotations
 
 import math
 import os
+import time
 
 import cv2
 import mediapipe as mp
@@ -21,6 +21,7 @@ from aura.mirror_plane import MirrorPlaneEstimator  # Imported the new math esti
 
 # New Refactored Modules
 from aura.multi_detector import AnthropometricValidator, MultiSkeletonDetector
+from aura.pose_fusion import DualViewPoseFuser
 from aura.reconstruction import StereoReconstructor
 
 # UI and Input modules
@@ -59,49 +60,94 @@ class AuraEngine:
         frame_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
         # --- CAMERA CALIBRATION & ARUCO ---
+        # A generic pinhole matrix may be useful for image/UI experiments, but
+        # it must never enable metric stereo reconstruction.
         self.camera_matrix = None
         self.dist_coeffs = None
         self.apply_calibration = False
+        self.camera_is_calibrated = False
+        self.calibration_file_available = False
 
         calib_path = "camera_calibration.npz"
+        loaded_camera_matrix = None
+        loaded_dist_coeffs = None
         if os.path.exists(calib_path):
-            with np.load(calib_path) as data:
-                loaded_camera_matrix = data["camera_matrix"]
-                loaded_dist_coeffs = data["dist_coeffs"]
-
-            if isinstance(self.source, int):
-                self.apply_calibration = True
-                self.camera_matrix = loaded_camera_matrix
-                self.dist_coeffs = loaded_dist_coeffs
-            else:
-                print(f"\n[INFO] Video source detected: {self.source}")
-                ans = (
-                    input("Apply optical calibration (undistort)? [y/N]: ")
-                    .strip()
-                    .lower()
+            try:
+                with np.load(calib_path) as data:
+                    loaded_camera_matrix = np.asarray(
+                        data["camera_matrix"], dtype=np.float32
+                    )
+                    loaded_dist_coeffs = np.asarray(
+                        data["dist_coeffs"], dtype=np.float32
+                    )
+                    stored_width = (
+                        int(data["image_width"]) if "image_width" in data else None
+                    )
+                    stored_height = (
+                        int(data["image_height"]) if "image_height" in data else None
+                    )
+                valid_intrinsics = (
+                    loaded_camera_matrix.shape == (3, 3)
+                    and loaded_dist_coeffs.size >= 4
+                    and np.isfinite(loaded_camera_matrix).all()
+                    and np.isfinite(loaded_dist_coeffs).all()
                 )
-                if ans == "y":
-                    self.apply_calibration = True
-                    self.camera_matrix = loaded_camera_matrix
-                    self.dist_coeffs = loaded_dist_coeffs
+                resolution_matches = (
+                    stored_width is None
+                    or stored_height is None
+                    or frame_width <= 0
+                    or frame_height <= 0
+                    or (stored_width == frame_width and stored_height == frame_height)
+                )
+                self.calibration_file_available = bool(
+                    valid_intrinsics and resolution_matches
+                )
+                if not self.calibration_file_available:
+                    print(
+                        "[WARNING] Calibration file is invalid or its stored resolution "
+                        f"does not match the capture ({frame_width}x{frame_height}). "
+                        "Estimated dual-view mode will be used."
+                    )
                 else:
-                    self.apply_calibration = False
+                    print(f"\n[INFO] Calibration file found: {calib_path}")
+                    if stored_width is None or stored_height is None:
+                        print(
+                            "[WARNING] This calibration file has no stored resolution metadata. "
+                            "Confirm that it was generated at the current capture resolution."
+                        )
+                    answer = (
+                        input("Use this camera calibration for metric stereo? [y/N]: ")
+                        .strip()
+                        .lower()
+                    )
+                    if answer == "y":
+                        self.camera_matrix = loaded_camera_matrix
+                        self.dist_coeffs = loaded_dist_coeffs.reshape(-1, 1)
+                        self.apply_calibration = True
+                        self.camera_is_calibrated = True
+                    else:
+                        print(
+                            "[INFO] Calibration not activated. Using estimated dual-view fusion."
+                        )
+            except (OSError, KeyError, ValueError) as exc:
+                print(f"[WARNING] Cannot load camera calibration: {exc}")
 
-        # Fallback: Generate a generic pinhole camera matrix for uncalibrated/synthetic video
         if self.camera_matrix is None:
-            # Approximate focal length for a standard ~60 degree FOV camera
-            focal_length = frame_width
+            focal_length = float(max(frame_width, 1))
             self.camera_matrix = np.array(
                 [
-                    [focal_length, 0, frame_width / 2.0],
-                    [0, focal_length, frame_height / 2.0],
-                    [0, 0, 1],
+                    [focal_length, 0.0, frame_width / 2.0],
+                    [0.0, focal_length, frame_height / 2.0],
+                    [0.0, 0.0, 1.0],
                 ],
                 dtype=np.float32,
             )
             self.dist_coeffs = np.zeros((4, 1), dtype=np.float32)
+            self.apply_calibration = False
+            self.camera_is_calibrated = False
             print(
-                f"[INFO] Using generic pinhole camera matrix (Focal: {focal_length}).\n"
+                "[INFO] Metric calibration inactive. Dual View Estimated Fusion "
+                "will be used when the mirror split is ready.\n"
             )
 
         # Initialize ArUco tracker (marker size accurately set to 18cm = 0.18m)
@@ -116,9 +162,17 @@ class AuraEngine:
 
         # New Structural Subsystems
         self.reconstructor: StereoReconstructor | None = None
-        if self.camera_matrix is not None:
+        if self.camera_is_calibrated:
             self.reconstructor = StereoReconstructor(self.camera_matrix)
 
+        # Estimated fusion is the default after automatic splitting. It is
+        # independent from the calibrated metric reconstruction branch.
+        self.pose_fuser = DualViewPoseFuser()
+        self.last_fusion_result = None  # Diagnostic snapshots; not rendered as PiP.
+        self._last_estimated_recording_notice = -1
+
+        # Retained for compatibility/diagnostic access; no longer used as an
+        # uncalibrated stereo fallback.
         self.svd_estimator = MirrorPlaneEstimator(ema_alpha=0.15)
         self.validator = AnthropometricValidator(units="meters")
         self.dtw_analyzer = DTWTemporalAnalyzer(sensitivity=5.0)
@@ -240,11 +294,10 @@ class AuraEngine:
         """Starts the main video loop."""
 
         init_log = "AURA System Initialized. Looking for user..."
-        if self.camera_matrix is not None:
-            status = "applied" if self.apply_calibration else "loaded (not applied)"
-            init_log = (
-                f"AURA Initialized. Calibration file {status}. Looking for user..."
-            )
+        if self.camera_is_calibrated:
+            init_log = "AURA Initialized. Metric camera calibration active. Looking for user..."
+        else:
+            init_log = "AURA Initialized. Dual View Estimated Fusion is the default mode. Looking for user..."
 
         self.sys_logger.log(
             init_log,
@@ -273,16 +326,15 @@ class AuraEngine:
 
             # --- PHASE 1: OPTICAL CORRECTION AND ARUCO TRACKING ---
             aruco_poses = {}
-            if self.camera_matrix is not None and self.dist_coeffs is not None:
-                if self.apply_calibration:
-                    frame = cv2.undistort(frame, self.camera_matrix, self.dist_coeffs)
-                    # CRITICAL FIX: The frame is now physically undistorted.
-                    # We must pass zeroed distortion coefficients to the ArUco tracker
-                    # to prevent it from double-applying the distortion mathematically.
-                    active_dist_coeffs = np.zeros((4, 1), dtype=np.float32)
-                else:
-                    active_dist_coeffs = self.dist_coeffs
-
+            if (
+                self.camera_is_calibrated
+                and self.camera_matrix is not None
+                and self.dist_coeffs is not None
+            ):
+                frame = cv2.undistort(frame, self.camera_matrix, self.dist_coeffs)
+                # solvePnP must not apply distortion a second time to an already
+                # undistorted frame.
+                active_dist_coeffs = np.zeros((4, 1), dtype=np.float32)
                 frame, aruco_poses = self.aruco_tracker.process_frame(
                     frame, self.camera_matrix, active_dist_coeffs
                 )
@@ -308,9 +360,11 @@ class AuraEngine:
             mirror_roi = None
             fused_3d = None
             plane_normal = None
+            fused_pose_result = None
 
             # State flags for the current frame
             is_stereo_validated = False
+            is_estimated_fusion = False
             hud_status = "3D FUSION: SINGLE"
 
             # ==========================================
@@ -350,6 +404,8 @@ class AuraEngine:
                         self.multi_detector = MultiSkeletonDetector(
                             split_ratio=split_ratio
                         )
+                        self.pose_fuser.reset()
+                        self.last_fusion_result = None
                         cv2.destroyWindow(window_title)
                     else:
                         cv2.imshow(window_title, frame)
@@ -359,7 +415,9 @@ class AuraEngine:
                         active_frame = frame
                 else:
                     # 1. Get 2D Pixel Landmarks
-                    pipeline_data = self.multi_detector.process_frame(frame)
+                    pipeline_data = self.multi_detector.process_frame(
+                        frame, frame_id=self.frame_count, timestamp=time.perf_counter()
+                    )
 
                     for user_msg, expert_msg in pipeline_data.get("logs", []):
                         self.sys_logger.log(user_msg, expert_msg)
@@ -373,100 +431,68 @@ class AuraEngine:
                     reflected_pose_2d = pipeline_data.get("reflected_pose_2d")
 
                     active_frame = front_roi
-                    reflection_matrix = None
-
-                    # 2. Attempt Full Stereoscopic Pipeline (Priority Route)
-                    if (
-                        direct_pose_2d is not None
-                        and reflected_pose_2d is not None
+                    # 2. Metric reconstruction is enabled only after the user
+                    # explicitly opted into a valid camera calibration and the
+                    # mirror ArUco marker is currently detected.
+                    metric_inputs_ready = (
+                        self.camera_is_calibrated
                         and self.reconstructor is not None
-                    ):
-                        if aruco_rvec is not None and aruco_tvec is not None:
-                            # Mode 1: Exact ArUco Tracker Metric Plane
+                        and aruco_rvec is not None
+                        and aruco_tvec is not None
+                        and direct_pose_2d is not None
+                        and reflected_pose_2d is not None
+                    )
+
+                    if metric_inputs_ready:
+                        try:
                             mirror_data = self.aruco_tracker.estimate_mirror_plane(
                                 aruco_rvec, aruco_tvec
                             )
                             reflection_matrix = mirror_data["reflection_matrix"]
-                            plane_normal = mirror_data["normal"]
-                            hud_status = "3D FUSION: STEREO (ARUCO)"
-                        else:
-                            # Mode 2: SVD Markerless Fallback
-                            direct_3d_local = self.multi_detector.front_detector.get_world_landmark_array()
-                            reflected_3d_local = self.multi_detector.mirror_detector.get_world_landmark_array()
-
-                            if (
-                                direct_3d_local is not None
-                                and reflected_3d_local is not None
-                            ):
-                                # 1. Flip the reflected 3D landmarks to match the direct view's coordinate system
-                                reflected_3d_unflipped = reflected_3d_local.copy()
-                                reflected_3d_unflipped[:, 0] *= -1
-
-                                # 2. SolvePnP to estimate camera poses for both views
-                                active_dist = np.zeros((4, 1), dtype=np.float32)
-                                if (
-                                    self.dist_coeffs is not None
-                                    and not self.apply_calibration
-                                ):
-                                    active_dist = self.dist_coeffs
-
-                                success1, rvec1, tvec1 = cv2.solvePnP(
-                                    direct_3d_local.astype(np.float32),
-                                    direct_pose_2d.astype(np.float32),
-                                    self.camera_matrix,
-                                    active_dist,
-                                    flags=cv2.SOLVEPNP_SQPNP,
-                                )
-                                success2, rvec2, tvec2 = cv2.solvePnP(
-                                    reflected_3d_unflipped.astype(np.float32),
-                                    reflected_pose_2d.astype(np.float32),
-                                    self.camera_matrix,
-                                    active_dist,
-                                    flags=cv2.SOLVEPNP_SQPNP,
-                                )
-
-                                if success1 and success2:
-                                    R1, _ = cv2.Rodrigues(rvec1)
-                                    R2, _ = cv2.Rodrigues(rvec2)
-
-                                    # 3. Transform the local landmarks to the absolute camera space
-                                    direct_3d_abs = (
-                                        R1 @ direct_3d_local.T
-                                    ).T + tvec1.reshape(1, 3)
-                                    reflected_3d_abs = (
-                                        R2 @ reflected_3d_unflipped.T
-                                    ).T + tvec2.reshape(1, 3)
-
-                                    # 4. Estimate the mirror plane using SVD on the absolute 3D landmarks
-                                    reflection_matrix, plane_normal = (
-                                        self.svd_estimator.estimate_plane(
-                                            direct_3d_abs, reflected_3d_abs
-                                        )
-                                    )
-                                    if reflection_matrix is not None:
-                                        hud_status = "3D FUSION: STEREO (SVD)"
-
-                        # Triangulate metric 3D landmarks if a plane was found
-                        if reflection_matrix is not None:
-                            raw_landmarks_3d = self.reconstructor.triangulate_landmarks(
+                            metric_points = self.reconstructor.triangulate_landmarks(
                                 direct_pose_2d, reflected_pose_2d, reflection_matrix
                             )
-
-                            # Validate metric integrity against human anatomy
-                            if self.validator.validate_skeleton_3d(raw_landmarks_3d):
-                                fused_3d = self._ground_landmarks(raw_landmarks_3d)
+                            if self.validator.validate_skeleton_3d(metric_points):
+                                fused_3d = self._ground_landmarks(metric_points)
+                                plane_normal = mirror_data["normal"]
                                 is_stereo_validated = True
+                                self.last_fusion_result = None
+                                hud_status = "METRIC STEREO: CALIBRATED + ARUCO"
                             else:
                                 self.sys_logger.log(
-                                    "Biometric invalidation.",
-                                    "AnthropometricValidator rejected 3D lengths. Falling back to single view.",
+                                    "Metric reconstruction rejected.",
+                                    "Anthropometric validation failed; switching to Dual View Estimated Fusion for this frame.",
                                 )
+                        except (ValueError, cv2.error, np.linalg.LinAlgError) as exc:
+                            self.sys_logger.log(
+                                "Metric reconstruction unavailable.",
+                                f"ArUco stereo reconstruction failed: {exc}. Using estimated fusion.",
+                            )
 
-                    # 3. Fallback Route (Base Frontal Pose)
-                    if not is_stereo_validated and active_results:
-                        front_world_lm = self.multi_detector.front_detector.get_world_landmark_array()
-                        fused_3d = self._ground_landmarks(front_world_lm)
-                        hud_status = "3D FUSION: SINGLE"
+                    # Default route: always retain a useful Front-referenced
+                    # skeleton and integrate Mirror information as soon as the
+                    # empirical alignment has accumulated enough observations.
+                    if not is_stereo_validated:
+                        front_observation = pipeline_data.get("front_observation")
+                        mirror_observation = pipeline_data.get("mirror_observation")
+                        fused_pose_result = self.pose_fuser.update(
+                            front_observation, mirror_observation
+                        )
+                        self.last_fusion_result = fused_pose_result
+                        if fused_pose_result is not None:
+                            fused_3d = self._ground_landmarks(
+                                fused_pose_result.landmarks_3d
+                            )
+                            is_estimated_fusion = True
+                            if fused_pose_result.alignment_ready:
+                                hud_status = (
+                                    "DUAL VIEW ESTIMATED | "
+                                    f"FUSED Q:{fused_pose_result.fusion_quality:.2f}"
+                                )
+                            else:
+                                hud_status = "DUAL VIEW ESTIMATED | ALIGNING MIRROR"
+                        else:
+                            hud_status = "DUAL VIEW ESTIMATED | FRONT LOST"
 
                     # HUD Drawing
                     if self._is_valid_roi(front_roi):
@@ -482,7 +508,11 @@ class AuraEngine:
                             (15, 175),
                             cv2.FONT_HERSHEY_SIMPLEX,
                             0.6,
-                            (0, 255, 0) if is_stereo_validated else (0, 0, 255),
+                            (0, 255, 0)
+                            if is_stereo_validated
+                            else (
+                                (0, 190, 255) if is_estimated_fusion else (0, 0, 255)
+                            ),
                             2,
                             cv2.LINE_AA,
                         )
@@ -512,12 +542,18 @@ class AuraEngine:
                     elif self.recording_state == REC_USER:
                         self.dtw_analyzer.add_user_frame(kinematic_features)
                 else:
-                    # Prevent silent injection of non-metric frames into DTW
-                    if self.recording_state in [REC_GOLDEN, REC_USER]:
+                    # Estimated recording is intentionally deferred to the next
+                    # phase, where its Golden Standards get a separate namespace.
+                    if (
+                        self.recording_state in [REC_GOLDEN, REC_USER]
+                        and self.frame_count - self._last_estimated_recording_notice
+                        >= 60
+                    ):
                         self.sys_logger.log(
-                            "Warning: Frame dropped from recording.",
-                            "Stereo triangulation inactive. Cannot record monocular fallback into Golden Standard.",
+                            "Estimated recording is not enabled yet.",
+                            "Dual View Estimated Fusion is active. Estimated Golden Standards will be stored separately from metric references in the next implementation phase.",
                         )
+                        self._last_estimated_recording_notice = self.frame_count
 
             live_pacing_msg = ""
             if self.recording_state == REC_USER:
@@ -547,12 +583,12 @@ class AuraEngine:
 
             # Evaluate biomechanical joint colors against golden standard
             joint_colors = self._evaluate_joint_colors(
-                active_results, is_stereo_validated
+                active_results, (is_stereo_validated or is_estimated_fusion)
             )
 
             # Render Single Unified 3D Viewport
             cv2.imshow(
-                "AURA - 3D Digital Twin & SVD Inspector",
+                "AURA - 3D Digital Twin",
                 self.viewer_3d.render_scene(fused_3d, plane_normal, joint_colors),
             )
             cv2.imshow("AURA - System Logs", self.sys_logger.render_events())

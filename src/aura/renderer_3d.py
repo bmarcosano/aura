@@ -1,7 +1,7 @@
-"""
-renderer_3d.py: Unified 3D Digital Twin & SVD Inspector rendering module for AURA.
-Combines 3D skeletal rendering, SVD mirror plane normal visualization as a directed vector,
-floor grid grounding, dynamic joint color-coding, and collision-free orbital controls.
+"""Single-view 3D Digital Twin renderer for AURA.
+
+Renders one fused skeleton with optional calibrated plane diagnostics and
+orbital camera controls. Intermediate poses are kept out of the render loop.
 """
 
 from __future__ import annotations
@@ -12,8 +12,8 @@ import numpy as np
 
 class Aura3DViewer:
     """
-    Renders a unified 3D Digital Twin, floor grid, SVD mirror plane normal vector,
-    and dynamic joint status colors using an orbital camera model.
+    Renders the final fused Digital Twin and optional calibrated plane diagnostics
+    using one orbital camera model. Intermediate poses are never rendered here.
     """
 
     def __init__(self, width: int = 800, height: int = 600) -> None:
