@@ -20,19 +20,20 @@ class PoseDetector:
         min_detection_confidence: float = 0.5,
         min_tracking_confidence: float = 0.5,
     ) -> None:
-        # Direct initialization using modern MediaPipe solutions structure
+        # Keep the configuration so the MediaPipe graph can be recreated after
+        # changing from full-frame tracking to a cropped ROI.
         self.mp_pose = mp.solutions.pose
         self.mp_draw = mp.solutions.drawing_utils
-
-        self.pose = self.mp_pose.Pose(
-            static_image_mode=static_image_mode,
-            model_complexity=model_complexity,
-            smooth_landmarks=smooth_landmarks,
-            min_detection_confidence=min_detection_confidence,
-            min_tracking_confidence=min_tracking_confidence,
-        )
-
+        self._pose_config = {
+            "static_image_mode": static_image_mode,
+            "model_complexity": model_complexity,
+            "smooth_landmarks": smooth_landmarks,
+            "min_detection_confidence": min_detection_confidence,
+            "min_tracking_confidence": min_tracking_confidence,
+        }
+        self.pose = self.mp_pose.Pose(**self._pose_config)
         self.results = None
+        self._closed = False
         print("✅ PoseDetector initialized successfully.")
 
     def detect(self, frame: np.ndarray, draw: bool = True) -> np.ndarray | None:
@@ -40,6 +41,11 @@ class PoseDetector:
         Processes via MediaPipe, draws the skeleton overlay,
         and returns the pixel landmark array.
         """
+        if self._closed or self.pose is None:
+            raise RuntimeError("PoseDetector is closed; call reset() before reuse.")
+        if frame is None or frame.ndim != 3 or frame.size == 0:
+            raise ValueError("frame must be a non-empty BGR image")
+
         h, w, _ = frame.shape
         image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         image_rgb.flags.writeable = False
@@ -142,3 +148,22 @@ class PoseDetector:
                 presence = visibility
             values.append(presence)
         return np.clip(np.asarray(values, dtype=np.float32), 0.0, 1.0)
+
+    def close(self) -> None:
+        """Release the underlying MediaPipe graph. Safe to call more than once."""
+        if self._closed:
+            return
+        pose = self.pose
+        self.pose = None
+        self.results = None
+        self._closed = True
+        close_method = getattr(pose, "close", None)
+        if callable(close_method):
+            close_method()
+
+    def reset(self) -> None:
+        """Restart tracking state while preserving this detector's configuration."""
+        self.close()
+        self.pose = self.mp_pose.Pose(**self._pose_config)
+        self.results = None
+        self._closed = False

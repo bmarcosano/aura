@@ -63,13 +63,34 @@ class MultiSkeletonDetector:
     world X coordinate is unflipped for the estimated alignment pipeline.
     """
 
-    def __init__(self, split_ratio: float = 0.5) -> None:
+    def __init__(
+        self,
+        split_ratio: float = 0.5,
+        front_detector: PoseDetector | None = None,
+        mirror_detector: PoseDetector | None = None,
+    ) -> None:
         if not 0.0 < float(split_ratio) < 1.0:
             raise ValueError("split_ratio must be strictly between 0 and 1")
         self.split_ratio = float(split_ratio)
-        self.front_detector = PoseDetector()
-        self.mirror_detector = PoseDetector()
+
+        # An injected detector remains owned by the caller. This lets AuraEngine
+        # reuse its single-view detector as the front-view detector after splitting.
+        self._owns_front_detector = front_detector is None
+        self.front_detector = (
+            front_detector if front_detector is not None else PoseDetector()
+        )
+        self._owns_mirror_detector = mirror_detector is None
+        try:
+            self.mirror_detector = (
+                mirror_detector if mirror_detector is not None else PoseDetector()
+            )
+        except Exception:
+            if self._owns_front_detector:
+                self.front_detector.close()
+            raise
+
         self._frame_counter = 0
+        self._closed = False
 
     def _crop_rois(self, frame: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         if frame is None or frame.ndim != 3 or frame.shape[1] < 2:
@@ -167,6 +188,8 @@ class MultiSkeletonDetector:
         Both observations always receive the same values because they originate
         from the same captured source frame.
         """
+        if self._closed:
+            raise RuntimeError("MultiSkeletonDetector is closed")
         if frame is None or frame.ndim != 3 or frame.size == 0:
             raise ValueError("frame must be a non-empty BGR image")
 
@@ -254,3 +277,29 @@ class MultiSkeletonDetector:
             "is_valid": True,
             "logs": logs,
         }
+
+    def close(self) -> None:
+        """Release only detectors created and owned by this instance.
+
+        Injected detectors are owned by the caller and must be closed there.
+        """
+        if self._closed:
+            return
+        self._closed = True
+        close_errors = []
+        owned_detectors = []
+        if self._owns_front_detector:
+            owned_detectors.append(("front", self.front_detector))
+        if self._owns_mirror_detector:
+            owned_detectors.append(("mirror", self.mirror_detector))
+
+        for name, detector in owned_detectors:
+            try:
+                detector.close()
+            except Exception as exc:  # noqa: BLE001 - Attempt to close every owned detector.
+                close_errors.append(f"{name}: {exc}")
+
+        if close_errors:
+            raise RuntimeError(
+                "Failed to close MediaPipe detector(s): " + "; ".join(close_errors)
+            )

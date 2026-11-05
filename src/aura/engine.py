@@ -9,6 +9,7 @@ from __future__ import annotations
 import math
 import os
 import time
+from collections import deque
 
 import cv2
 import mediapipe as mp
@@ -67,6 +68,8 @@ class AuraEngine:
         self.apply_calibration = False
         self.camera_is_calibrated = False
         self.calibration_file_available = False
+        self.calibration_rms: float | None = None
+        self.calibration_view_count: int | None = None
 
         calib_path = "camera_calibration.npz"
         loaded_camera_matrix = None
@@ -85,6 +88,10 @@ class AuraEngine:
                     )
                     stored_height = (
                         int(data["image_height"]) if "image_height" in data else None
+                    )
+                    self.calibration_rms = float(data["rms"]) if "rms" in data else None
+                    self.calibration_view_count = (
+                        int(data["num_views"]) if "num_views" in data else None
                     )
                 valid_intrinsics = (
                     loaded_camera_matrix.shape == (3, 3)
@@ -115,6 +122,21 @@ class AuraEngine:
                             "[WARNING] This calibration file has no stored resolution metadata. "
                             "Confirm that it was generated at the current capture resolution."
                         )
+                    if self.calibration_rms is None:
+                        print(
+                            "[WARNING] Calibration RMS is not stored in this legacy file; "
+                            "optical calibration quality is unknown."
+                        )
+                    else:
+                        print(
+                            f"[INFO] Calibration RMS: {self.calibration_rms:.3f} px "
+                            f"({self.calibration_view_count or 'unknown'} views)."
+                        )
+                        if self.calibration_rms > 1.5:
+                            print(
+                                "[WARNING] Calibration RMS is relatively high. "
+                                "Consider recalibrating with more diverse checkerboard poses."
+                            )
                     answer = (
                         input("Use this camera calibration for metric stereo? [y/N]: ")
                         .strip()
@@ -169,11 +191,36 @@ class AuraEngine:
         # independent from the calibrated metric reconstruction branch.
         self.pose_fuser = DualViewPoseFuser()
         self.last_fusion_result = None  # Diagnostic snapshots; not rendered as PiP.
-        self._last_estimated_recording_notice = -1
+
+        # Buffer for EMA filter on render offset and floor stabilization
+        self._smoothed_render_offset: np.ndarray | None = None
+        self._smoothed_floor_y: float | None = None
+        # Smoothing factor for vertical jitter reduction (higher = more responsive, lower = smoother)
+        self._floor_ema_alpha: float = 0.35
+        # Smoothing factor for horizontal jitter reduction
+        self._ema_alpha: float = 0.15
+
+        # Estimated root motion is tracked from the Front View image-space pelvis.
+        # It moves only the rendered skeleton and never changes the fused pose.
+        self._estimated_root_reference_2d: np.ndarray | None = None
+        self._estimated_root_filtered_2d: np.ndarray | None = None
+        self._estimated_root_base_translation = np.zeros(3, dtype=np.float32)
+        self._estimated_root_translation = np.zeros(3, dtype=np.float32)
+        self._estimated_root_scale_samples: deque[float] = deque(maxlen=15)
+        self._estimated_root_scale: float | None = None
+        self._estimated_root_scale_frozen = False
+        self._estimated_root_axis_signs: np.ndarray | None = None
+        self._estimated_root_missing_frames = 0
+        self._estimated_root_needs_rebase = False
+        # Floor marker ID 0 defines a stable camera-to-floor frame for metric
+        # visualization. It is captured once, not re-estimated every frame.
+        self._floor_frame_basis: np.ndarray | None = None
+        self._floor_frame_origin: np.ndarray | None = None
+        self._floor_frame_candidates: list[tuple[np.ndarray, np.ndarray]] = []
 
         # Retained for compatibility/diagnostic access; no longer used as an
         # uncalibrated stereo fallback.
-        self.svd_estimator = MirrorPlaneEstimator(ema_alpha=0.15)
+        self.svd_estimator = MirrorPlaneEstimator(ema_alpha=self._ema_alpha)
         self.validator = AnthropometricValidator(units="meters")
         self.dtw_analyzer = DTWTemporalAnalyzer(sensitivity=5.0)
 
@@ -182,16 +229,23 @@ class AuraEngine:
         self.viewer_3d = Aura3DViewer(width=800, height=600)
         self.sys_logger = AuraLogger()
 
-        # Silent Split setup
+        # Silent split detection uses two short-lived MediaPipe graphs. They are
+        # released as soon as the mirror has been confirmed; the primary detector
+        # is reused later as the Dual View front detector.
         mp_pose = mp.solutions.pose
         self.silent_checker_left = mp_pose.Pose(min_detection_confidence=0.5)
         self.silent_checker_right = mp_pose.Pose(min_detection_confidence=0.5)
+        self._silent_checkers_closed = False
+        self._shutdown = False
         self.pearson_buffer_left: list[float] = []
         self.pearson_buffer_right: list[float] = []
 
         # System state
         self.current_state = STATE_SINGLE
         self.recording_state = REC_IDLE
+        # True only when the current frame has passed calibrated metric-stereo validation.
+        # Keyboard recording commands use this flag to prevent estimated/metric mixing.
+        self._metric_stereo_validated_current_frame = False
         self.dtw_last_result = None
         self.frame_count = 0
         self._window_placed = False
@@ -220,6 +274,231 @@ class AuraEngine:
         grounded[:, 2] -= target_z
 
         return grounded
+
+    def _prepare_estimated_render_landmarks(
+        self,
+        landmarks_3d: np.ndarray | None,
+        valid_mask: np.ndarray | None = None,
+    ) -> np.ndarray | None:
+        """Rigid Floor Baseline Anchor.
+
+        Locks the vertical floor level (Y) to the initial standing baseline
+        captured at startup. This prevents the feet from sinking or floating
+        when the user drops into a deep squat.
+        """
+        if landmarks_3d is None or np.asarray(landmarks_3d).shape != (33, 3):
+            return landmarks_3d
+
+        # Create a copy to avoid polluting the original biometric data
+        points = np.asarray(landmarks_3d, dtype=np.float32).copy()
+        if not np.isfinite(points).all():
+            return points
+
+        # Use the ankles (27, 28) as the central horizontal pivot.
+        left_ankle = points[27]
+        right_ankle = points[28]
+
+        center_x = float((left_ankle[0] + right_ankle[0]) / 2.0)
+        center_z = float((left_ankle[2] + right_ankle[2]) / 2.0)
+
+        # Calculate instantaneous lowest point of the feet
+        feet_indices = [27, 28, 29, 30, 31, 32]
+        instant_target_y = float(np.max(points[feet_indices, 1]))
+
+        # Lock the floor baseline permanently using the first valid standing pose.
+        # This stops the floor from dropping down with you during a squat.
+        if self._smoothed_floor_y is None:
+            self._smoothed_floor_y = instant_target_y
+
+        # Shift entire skeleton using the frozen standing floor level
+        points[:, 0] -= center_x
+        points[:, 1] -= self._smoothed_floor_y
+        points[:, 2] -= center_z
+
+        return points
+
+    def _reset_estimated_root_motion(self) -> None:
+        """Reset the image-space root-motion estimator for a new tracking session."""
+        self._estimated_root_reference_2d = None
+        self._estimated_root_filtered_2d = None
+        self._estimated_root_base_translation = np.zeros(3, dtype=np.float32)
+        self._estimated_root_translation = np.zeros(3, dtype=np.float32)
+        self._estimated_root_scale_samples.clear()
+        self._estimated_root_scale = None
+        self._estimated_root_scale_frozen = False
+        self._estimated_root_axis_signs = None
+        self._estimated_root_missing_frames = 0
+        self._estimated_root_needs_rebase = False
+        self._smoothed_floor_y = None  # Reset floor stabilization buffer
+
+    @staticmethod
+    def _root_motion_measurement(observation):
+        """Return a reliable pelvis center and relative pixel-to-world scale estimate."""
+        if observation is None or not getattr(observation, "detection_valid", False):
+            return None
+
+        points_2d = getattr(observation, "landmarks_2d", None)
+        points_3d = getattr(observation, "landmarks_3d", None)
+        confidence = getattr(observation, "joint_confidence", None)
+        if points_2d is None or points_3d is None or confidence is None:
+            return None
+
+        points_2d = np.asarray(points_2d, dtype=np.float32)
+        points_3d = np.asarray(points_3d, dtype=np.float32)
+        confidence = np.asarray(confidence, dtype=np.float32).reshape(-1)
+        if (
+            points_2d.shape != (33, 2)
+            or points_3d.shape != (33, 3)
+            or confidence.shape != (33,)
+        ):
+            return None
+
+        anchor_indices = np.asarray([11, 12, 23, 24], dtype=int)
+        if not (
+            np.isfinite(points_2d[anchor_indices]).all()
+            and np.isfinite(points_3d[anchor_indices]).all()
+            and np.isfinite(confidence[anchor_indices]).all()
+        ):
+            return None
+        if np.min(confidence[anchor_indices]) < 0.25:
+            return None
+
+        hip_weights = np.maximum(confidence[[23, 24]], 0.05)
+        pelvis_center = np.average(points_2d[[23, 24]], axis=0, weights=hip_weights)
+
+        shoulder_width_pixels = float(np.linalg.norm(points_2d[11] - points_2d[12]))
+        shoulder_width_world = float(np.linalg.norm(points_3d[11] - points_3d[12]))
+        if shoulder_width_pixels < 15.0 or not 0.15 <= shoulder_width_world <= 0.80:
+            return None
+
+        # MediaPipe world coordinates are relative to the hips. The ratio below
+        # provides an approximate, session-relative conversion for image motion.
+        scale = shoulder_width_world / shoulder_width_pixels
+        if not np.isfinite(scale) or not 0.0002 <= scale <= 0.03:
+            return None
+
+        # Infer axis signs from the observed shoulder and torso directions instead
+        # of assuming that image and MediaPipe coordinate conventions match.
+        image_shoulder_dx = float(points_2d[12, 0] - points_2d[11, 0])
+        world_shoulder_dx = float(points_3d[12, 0] - points_3d[11, 0])
+        image_torso_dy = float(
+            np.mean(points_2d[[11, 12], 1]) - np.mean(points_2d[[23, 24], 1])
+        )
+        world_torso_dy = float(
+            np.mean(points_3d[[11, 12], 1]) - np.mean(points_3d[[23, 24], 1])
+        )
+        if abs(image_shoulder_dx) < 5.0 or abs(world_shoulder_dx) < 0.03:
+            return None
+        if abs(image_torso_dy) < 10.0 or abs(world_torso_dy) < 0.08:
+            return None
+
+        axis_signs = np.asarray(
+            [
+                1.0 if image_shoulder_dx * world_shoulder_dx > 0.0 else -1.0,
+                1.0 if image_torso_dy * world_torso_dy > 0.0 else -1.0,
+            ],
+            dtype=np.float32,
+        )
+        return pelvis_center.astype(np.float32), float(scale), axis_signs
+
+    def _update_estimated_root_motion(self, front_observation) -> np.ndarray:
+        """Estimate global X/Y movement from the Front View for rendering only."""
+        measurement = self._root_motion_measurement(front_observation)
+        if measurement is None:
+            self._estimated_root_missing_frames += 1
+            if self._estimated_root_missing_frames >= 12:
+                # Rebase after a prolonged loss to avoid a large reacquisition jump.
+                self._estimated_root_needs_rebase = True
+            return self._estimated_root_translation.copy()
+
+        pelvis_center, scale_sample, axis_signs = measurement
+        self._estimated_root_missing_frames = 0
+
+        if self._estimated_root_axis_signs is None:
+            self._estimated_root_axis_signs = axis_signs
+
+        if not self._estimated_root_scale_frozen:
+            self._estimated_root_scale_samples.append(scale_sample)
+            # Use the first valid scale immediately, then make it robust with a
+            # growing median window while the session is still initializing.
+            scale_values = np.asarray(
+                self._estimated_root_scale_samples, dtype=np.float32
+            )
+            self._estimated_root_scale = float(np.median(scale_values))
+            if len(self._estimated_root_scale_samples) >= 15:
+                self._estimated_root_scale_frozen = True
+
+        if (
+            self._estimated_root_reference_2d is None
+            or self._estimated_root_needs_rebase
+        ):
+            self._estimated_root_reference_2d = pelvis_center.copy()
+            self._estimated_root_filtered_2d = pelvis_center.copy()
+            if self._estimated_root_needs_rebase:
+                self._estimated_root_base_translation = (
+                    self._estimated_root_translation.copy()
+                )
+            else:
+                self._estimated_root_base_translation = np.zeros(3, dtype=np.float32)
+            self._estimated_root_needs_rebase = False
+            return self._estimated_root_translation.copy()
+
+        if self._estimated_root_filtered_2d is None:
+            self._estimated_root_filtered_2d = pelvis_center.copy()
+
+        # A light EMA suppresses landmark jitter without adding a heavy temporal model.
+        delta_pixels = pelvis_center - self._estimated_root_filtered_2d
+        max_step = 0.06 * max(
+            float(getattr(front_observation, "image_size", (640, 480))[0]), 1.0
+        )
+        delta_length = float(np.linalg.norm(delta_pixels))
+        if delta_length > max_step > 0.0:
+            delta_pixels *= max_step / delta_length
+        self._estimated_root_filtered_2d += 0.45 * delta_pixels
+
+        if (
+            self._estimated_root_scale is None
+            or self._estimated_root_axis_signs is None
+        ):
+            return self._estimated_root_translation.copy()
+
+        displacement_pixels = (
+            self._estimated_root_filtered_2d - self._estimated_root_reference_2d
+        )
+        translation = np.zeros(3, dtype=np.float32)
+        translation[0] = (
+            self._estimated_root_axis_signs[0]
+            * displacement_pixels[0]
+            * self._estimated_root_scale
+        )
+        translation[1] = (
+            self._estimated_root_axis_signs[1]
+            * displacement_pixels[1]
+            * self._estimated_root_scale
+        )
+        translation[2] = 0.0  # Depth is intentionally not inferred in estimated mode.
+
+        self._estimated_root_translation = (
+            self._estimated_root_base_translation + translation
+        ).astype(np.float32)
+        return self._estimated_root_translation.copy()
+
+    @staticmethod
+    def _observation_quality(observation) -> float:
+        if observation is None or not observation.detection_valid:
+            return 0.0
+        confidence = observation.joint_confidence
+        valid = observation.valid_joint_mask
+        return float(np.mean(confidence[valid])) if valid.any() else 0.0
+
+    def _floor_coordinates(self, points_camera: np.ndarray) -> np.ndarray:
+        """Convert metric camera-frame points into the frozen floor-marker frame."""
+        if self._floor_frame_basis is None or self._floor_frame_origin is None:
+            return np.asarray(points_camera, dtype=np.float32).copy()
+        points = np.asarray(points_camera, dtype=np.float32)
+        return ((points - self._floor_frame_origin) @ self._floor_frame_basis).astype(
+            np.float32
+        )
 
     def _evaluate_joint_colors(
         self, active_results, is_fused_valid: bool = True
@@ -317,6 +596,10 @@ class AuraEngine:
                         self.dtw_last_result = self.dtw_analyzer.evaluate_technique()
                     self.recording_state = REC_IDLE
 
+                if not isinstance(self.source, int):
+                    self._reset_estimated_root_motion()
+                    self._smoothed_render_offset = None
+                    self._smoothed_floor_y = None
                 self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                 success, frame = self.cap.read()
                 if not success:
@@ -344,14 +627,76 @@ class AuraEngine:
             aruco_tvec = None
 
             if 0 in aruco_poses:
-                _rvec_floor, tvec_floor = aruco_poses[0]
+                rvec_floor, tvec_floor = aruco_poses[0]
                 floor_dist = np.linalg.norm(tvec_floor)
                 self.sys_logger.log_metric("Floor Dist", f"{floor_dist:.2f} m")
+                floor_error = self.aruco_tracker.last_pose_errors.get(0)
+                if floor_error is not None:
+                    self.sys_logger.log_metric(
+                        "Floor ArUco Reproj", f"{floor_error:.2f} px"
+                    )
+                # Capture the floor reference once, from a plausible marker pose.
+                # This aligns the metric Digital Twin with gravity/floor instead
+                # of assuming that the webcam optical axes are already level.
+                if (
+                    self._floor_frame_basis is None
+                    and floor_error is not None
+                    and floor_error <= 3.0
+                ):
+                    try:
+                        floor_frame = self.aruco_tracker.estimate_floor_frame(
+                            rvec_floor, tvec_floor
+                        )
+                        self._floor_frame_candidates.append(
+                            (
+                                floor_frame["basis_camera"].astype(np.float64),
+                                floor_frame["origin_camera"].astype(np.float64),
+                            )
+                        )
+                        if len(self._floor_frame_candidates) >= 8:
+                            bases = [
+                                item[0] for item in self._floor_frame_candidates[-8:]
+                            ]
+                            origins = np.asarray(
+                                [item[1] for item in self._floor_frame_candidates[-8:]],
+                                dtype=np.float64,
+                            )
+                            mean_basis = np.mean(np.stack(bases), axis=0)
+                            u, _singular, vt = np.linalg.svd(mean_basis)
+                            correction = np.eye(3)
+                            if np.linalg.det(u @ vt) < 0.0:
+                                correction[-1, -1] = -1.0
+                            self._floor_frame_basis = (u @ correction @ vt).astype(
+                                np.float32
+                            )
+                            self._floor_frame_origin = np.median(
+                                origins, axis=0
+                            ).astype(np.float32)
+                            self.sys_logger.log(
+                                "Floor reference initialized.",
+                                "Camera-to-floor frame robustly averaged over 8 ArUco observations (ID 0).",
+                            )
+                    except (ValueError, np.linalg.LinAlgError):
+                        self._floor_frame_candidates.clear()
+                        self.sys_logger.log(
+                            "Floor reference unavailable.",
+                            "Could not derive a stable camera-to-floor coordinate frame from marker ID 0.",
+                        )
 
             if 1 in aruco_poses:
                 aruco_rvec, aruco_tvec = aruco_poses[1]
                 mirror_dist = np.linalg.norm(aruco_tvec)
                 self.sys_logger.log_metric("Mirror Dist", f"{mirror_dist:.2f} m")
+                mirror_error = self.aruco_tracker.last_pose_errors.get(1)
+                if mirror_error is not None:
+                    self.sys_logger.log_metric(
+                        "Mirror ArUco Reproj", f"{mirror_error:.2f} px"
+                    )
+
+            if self.camera_is_calibrated and self.calibration_rms is not None:
+                self.sys_logger.log_metric(
+                    "Calibration RMS", f"{self.calibration_rms:.2f} px"
+                )
 
             _, w = frame.shape[:2]
             active_frame = None
@@ -401,11 +746,20 @@ class AuraEngine:
                             "Auto Splitter calibration successful.",
                             "AutoROISplitter finalized ratio. Instantiating MultiSkeletonDetector.",
                         )
+                        # Stop using the temporary split-checker graphs before
+                        # allocating the mirror graph. Reuse the primary detector
+                        # for the front ROI instead of creating a duplicate graph.
+                        self._release_silent_checkers()
+                        self.single_detector.reset()
                         self.multi_detector = MultiSkeletonDetector(
-                            split_ratio=split_ratio
+                            split_ratio=split_ratio,
+                            front_detector=self.single_detector,
                         )
                         self.pose_fuser.reset()
                         self.last_fusion_result = None
+                        self._smoothed_render_offset = None  # Reset EMA buffer when initializing MultiSkeletonDetector
+                        self._smoothed_floor_y = None
+                        self._reset_estimated_root_motion()
                         cv2.destroyWindow(window_title)
                     else:
                         cv2.imshow(window_title, frame)
@@ -439,6 +793,9 @@ class AuraEngine:
                         and self.reconstructor is not None
                         and aruco_rvec is not None
                         and aruco_tvec is not None
+                        and self._floor_frame_basis is not None
+                        and self.aruco_tracker.last_pose_errors.get(1, float("inf"))
+                        <= 5.0
                         and direct_pose_2d is not None
                         and reflected_pose_2d is not None
                     )
@@ -453,11 +810,18 @@ class AuraEngine:
                                 direct_pose_2d, reflected_pose_2d, reflection_matrix
                             )
                             if self.validator.validate_skeleton_3d(metric_points):
-                                fused_3d = self._ground_landmarks(metric_points)
-                                plane_normal = mirror_data["normal"]
+                                fused_3d = self._floor_coordinates(metric_points)
+                                if self._floor_frame_basis is not None:
+                                    plane_normal = (
+                                        np.asarray(mirror_data["normal"])
+                                        @ self._floor_frame_basis
+                                    )
+                                    hud_status = "METRIC STEREO | FLOOR ALIGNED"
+                                else:
+                                    plane_normal = mirror_data["normal"]
+                                    hud_status = "METRIC STEREO | CAMERA FRAME"
                                 is_stereo_validated = True
                                 self.last_fusion_result = None
-                                hud_status = "METRIC STEREO: CALIBRATED + ARUCO"
                             else:
                                 self.sys_logger.log(
                                     "Metric reconstruction rejected.",
@@ -480,17 +844,72 @@ class AuraEngine:
                         )
                         self.last_fusion_result = fused_pose_result
                         if fused_pose_result is not None:
-                            fused_3d = self._ground_landmarks(
-                                fused_pose_result.landmarks_3d
+                            fused_3d = self._prepare_estimated_render_landmarks(
+                                fused_pose_result.landmarks_3d,
+                                fused_pose_result.joint_valid,
                             )
+                            # Add Front-derived global movement to the render copy only.
+                            # The anatomical fused pose remains pelvis-relative and untouched.
+                            root_translation = self._update_estimated_root_motion(
+                                front_observation
+                            )
+                            if fused_3d is not None:
+                                fused_3d = np.asarray(
+                                    fused_3d, dtype=np.float32
+                                ) + root_translation.reshape(1, 3)
                             is_estimated_fusion = True
+                            front_quality = self._observation_quality(front_observation)
+                            mirror_quality = self._observation_quality(
+                                mirror_observation
+                            )
+                            source_counts = {
+                                source: fused_pose_result.joint_sources.count(source)
+                                for source in set(fused_pose_result.joint_sources)
+                            }
+                            mirror_dominant_sources = {
+                                "MIRROR_DOMINANT",
+                                "MIRROR_ONLY",
+                                "MIRROR_CONFLICT_DOMINANT",
+                            }
+                            mirror_dominant = sum(
+                                count
+                                for source, count in source_counts.items()
+                                if source in mirror_dominant_sources
+                            )
+                            valid_count = int(
+                                np.count_nonzero(fused_pose_result.joint_valid)
+                            )
+                            self.sys_logger.log_metric(
+                                "Front Detect Q", f"{front_quality:.2f}"
+                            )
+                            self.sys_logger.log_metric(
+                                "Mirror Detect Q", f"{mirror_quality:.2f}"
+                            )
+                            self.sys_logger.log_metric(
+                                "Alignment Q",
+                                f"{fused_pose_result.alignment_quality:.2f}",
+                            )
+                            self.sys_logger.log_metric(
+                                "Fusion Q", f"{fused_pose_result.fusion_quality:.2f}"
+                            )
+                            self.sys_logger.log_metric(
+                                "Mirror Dominant", f"{mirror_dominant}/33"
+                            )
+                            self.sys_logger.log_metric(
+                                "Valid Joints", f"{valid_count}/33"
+                            )
                             if fused_pose_result.alignment_ready:
                                 hud_status = (
                                     "DUAL VIEW ESTIMATED | "
-                                    f"FUSED Q:{fused_pose_result.fusion_quality:.2f}"
+                                    f"FQ:{fused_pose_result.fusion_quality:.2f} "
+                                    f"AQ:{fused_pose_result.alignment_quality:.2f}"
                                 )
                             else:
-                                hud_status = "DUAL VIEW ESTIMATED | ALIGNING MIRROR"
+                                hud_status = (
+                                    "DUAL VIEW ESTIMATED | ALIGNING "
+                                    f"({self.pose_fuser.aligner.result.sample_count}/"
+                                    f"{self.pose_fuser.aligner.min_samples})"
+                                )
                         else:
                             hud_status = "DUAL VIEW ESTIMATED | FRONT LOST"
 
@@ -507,7 +926,7 @@ class AuraEngine:
                             hud_status,
                             (15, 175),
                             cv2.FONT_HERSHEY_SIMPLEX,
-                            0.6,
+                            0.55,
                             (0, 255, 0)
                             if is_stereo_validated
                             else (
@@ -516,6 +935,22 @@ class AuraEngine:
                             2,
                             cv2.LINE_AA,
                         )
+                        if is_estimated_fusion and fused_pose_result is not None:
+                            detail = (
+                                f"DET F:{front_quality:.2f} M:{mirror_quality:.2f}  "
+                                f"MIRROR DOM:{mirror_dominant}/33  "
+                                f"VALID:{valid_count}/33"
+                            )
+                            cv2.putText(
+                                front_roi,
+                                detail,
+                                (15, 199),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                0.43,
+                                (180, 220, 255),
+                                1,
+                                cv2.LINE_AA,
+                            )
 
                     if self._is_valid_roi(mirror_roi) and mirror_results:
                         self.renderer.draw_postural_hud(
@@ -528,32 +963,42 @@ class AuraEngine:
             # ==========================================
             # PHASE 4: KINEMATIC EXTRACTION & PACING
             # ==========================================
-            # Protect Golden Standard recordings from single-view relative estimations
-            if fused_3d is not None:
-                if is_stereo_validated:
-                    kinematic_features = self.dtw_analyzer.extract_kinematic_features(
-                        fused_3d
-                    )
+            # Expose the effective mode of this exact frame to keyboard handlers.
+            self._metric_stereo_validated_current_frame = bool(is_stereo_validated)
 
-                    if self.recording_state == REC_GOLDEN:
-                        self.dtw_analyzer.golden_reference.append(
-                            kinematic_features.tolist()
-                        )
-                    elif self.recording_state == REC_USER:
-                        self.dtw_analyzer.add_user_frame(kinematic_features)
+            # A metric recording must remain metric for its entire trajectory.
+            # Abort rather than silently skipping estimated frames and later mixing modes.
+            if (
+                self.recording_state in (REC_GOLDEN, REC_USER)
+                and not self._metric_stereo_validated_current_frame
+            ):
+                interrupted_state = self.recording_state
+                if interrupted_state == REC_GOLDEN:
+                    self.dtw_analyzer.golden_reference.clear()
                 else:
-                    # Estimated recording is intentionally deferred to the next
-                    # phase, where its Golden Standards get a separate namespace.
-                    if (
-                        self.recording_state in [REC_GOLDEN, REC_USER]
-                        and self.frame_count - self._last_estimated_recording_notice
-                        >= 60
-                    ):
-                        self.sys_logger.log(
-                            "Estimated recording is not enabled yet.",
-                            "Dual View Estimated Fusion is active. Estimated Golden Standards will be stored separately from metric references in the next implementation phase.",
-                        )
-                        self._last_estimated_recording_notice = self.frame_count
+                    self.dtw_analyzer.reset_user_buffer()
+                self.recording_state = REC_IDLE
+                self.dtw_last_result = None
+                self.sys_logger.log(
+                    "Metric recording aborted: calibrated stereo is no longer valid.",
+                    (
+                        f"{interrupted_state} aborted. The current frame is not a validated "
+                        "Metric Stereo reconstruction; incomplete data was discarded to "
+                        "prevent mixing metric and estimated poses."
+                    ),
+                )
+
+            if fused_3d is not None and is_stereo_validated:
+                kinematic_features = self.dtw_analyzer.extract_kinematic_features(
+                    fused_3d
+                )
+
+                if self.recording_state == REC_GOLDEN:
+                    self.dtw_analyzer.golden_reference.append(
+                        kinematic_features.tolist()
+                    )
+                elif self.recording_state == REC_USER:
+                    self.dtw_analyzer.add_user_frame(kinematic_features)
 
             live_pacing_msg = ""
             if self.recording_state == REC_USER:
@@ -586,10 +1031,21 @@ class AuraEngine:
                 active_results, (is_stereo_validated or is_estimated_fusion)
             )
 
-            # Render Single Unified 3D Viewport
+            # Render exactly one skeleton. Invalid estimated joints are masked
+            # instead of drawing zero-filled placeholders as real anatomy.
+            render_joint_valid = (
+                fused_pose_result.joint_valid
+                if fused_pose_result is not None and is_estimated_fusion
+                else None
+            )
             cv2.imshow(
                 "AURA - 3D Digital Twin",
-                self.viewer_3d.render_scene(fused_3d, plane_normal, joint_colors),
+                self.viewer_3d.render_scene(
+                    fused_3d,
+                    plane_normal,
+                    joint_colors,
+                    joint_valid=render_joint_valid,
+                ),
             )
             cv2.imshow("AURA - System Logs", self.sys_logger.render_events())
             cv2.imshow("AURA - Live Telemetry", self.sys_logger.render_metrics())
@@ -617,8 +1073,26 @@ class AuraEngine:
             roi is not None and roi.ndim == 3 and roi.shape[0] > 0 and roi.shape[1] > 0
         )
 
+    def _release_silent_checkers(self) -> None:
+        """Close temporary split-detection graphs once automatic splitting is confirmed."""
+        if getattr(self, "_silent_checkers_closed", False):
+            return
+        for attribute_name in ("silent_checker_left", "silent_checker_right"):
+            checker = getattr(self, attribute_name, None)
+            if checker is not None:
+                close_method = getattr(checker, "close", None)
+                if callable(close_method):
+                    try:
+                        close_method()
+                    except Exception as exc:  # noqa: BLE001 - Continue releasing the remaining MediaPipe graphs.
+                        print(f"[WARNING] Could not close {attribute_name}: {exc}")
+                setattr(self, attribute_name, None)
+        self._silent_checkers_closed = True
+
     def _check_silent_split(self, frame: np.ndarray, w: int) -> None:
         if self.frame_count % 10 != 0:
+            return
+        if self.silent_checker_left is None or self.silent_checker_right is None:
             return
 
         mid = w // 2
@@ -684,6 +1158,8 @@ class AuraEngine:
                     f"Temporal correlation positive (Pearson r={pearson_r:.2f} > 0.95). FSM State -> MIRROR_MODE.",
                 )
                 self.current_state = STATE_MIRROR
+                # These graphs are no longer needed once the mirror is detected.
+                self._release_silent_checkers()
                 cv2.destroyWindow("AURA - Active Tracking")
 
     def _handle_commands(self, cmd: str) -> bool:
@@ -695,15 +1171,34 @@ class AuraEngine:
         elif cmd == "TOGGLE_LOG_MODE":
             self.sys_logger.toggle_mode()
         elif cmd == "REC_GOLDEN":
-            self.sys_logger.log(
-                "Starting Trainer Recording.",
-                "Initiating REC_GOLDEN state. Buffer cleared.",
-            )
-            self.recording_state = REC_GOLDEN
-            self.dtw_analyzer.golden_reference.clear()
-            self.dtw_last_result = None
+            if not getattr(self, "_metric_stereo_validated_current_frame", False):
+                self.sys_logger.log(
+                    "Golden Standard unavailable in Estimated mode.",
+                    (
+                        "G command rejected: Dual View Estimated Fusion provides a relative "
+                        "pose estimate, not a validated metric reconstruction. Record a "
+                        "trainer Golden Standard only while calibrated Metric Stereo is active."
+                    ),
+                )
+            else:
+                self.sys_logger.log(
+                    "Starting Metric Golden Standard recording.",
+                    "Initiating REC_GOLDEN state with validated calibrated stereo. Buffer cleared.",
+                )
+                self.recording_state = REC_GOLDEN
+                self.dtw_analyzer.golden_reference.clear()
+                self.dtw_last_result = None
         elif cmd == "REC_USER":
-            if not self.dtw_analyzer.golden_reference:
+            if not getattr(self, "_metric_stereo_validated_current_frame", False):
+                self.sys_logger.log(
+                    "Metric comparison unavailable in Estimated mode.",
+                    (
+                        "U command rejected: the active pose is estimated and cannot be "
+                        "compared with a metric Golden Standard. Switch to validated "
+                        "Calibrated Metric Stereo to record a comparable execution."
+                    ),
+                )
+            elif not self.dtw_analyzer.golden_reference:
                 self.sys_logger.log(
                     "Error: Need a Trainer recording first!",
                     "REC_USER aborted. DTW Golden reference array is empty.",
@@ -767,5 +1262,30 @@ class AuraEngine:
         return True
 
     def shutdown(self) -> None:
-        self.cap.release()
-        cv2.destroyAllWindows()
+        """Release capture, MediaPipe graphs and UI resources exactly once."""
+        if getattr(self, "_shutdown", False):
+            return
+        self._shutdown = True
+
+        try:
+            if getattr(self, "cap", None) is not None:
+                self.cap.release()
+        finally:
+            # MultiSkeletonDetector closes only the mirror graph it owns.
+            # Its front graph is injected and remains owned by AuraEngine.
+            multi_detector = getattr(self, "multi_detector", None)
+            if multi_detector is not None:
+                try:
+                    multi_detector.close()
+                except Exception as exc:  # noqa: BLE001 - Shutdown must continue after cleanup failures.
+                    print(f"[WARNING] Could not close dual-view detectors: {exc}")
+
+            single_detector = getattr(self, "single_detector", None)
+            if single_detector is not None:
+                try:
+                    single_detector.close()
+                except Exception as exc:  # noqa: BLE001 - Shutdown must continue after cleanup failures.
+                    print(f"[WARNING] Could not close primary detector: {exc}")
+
+            self._release_silent_checkers()
+            cv2.destroyAllWindows()
