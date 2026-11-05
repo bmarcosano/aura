@@ -65,7 +65,9 @@ def test_process_frame_basic(monkeypatch):
     # Assert
     assert "front_roi" in result
     assert "mirror_roi" in result
-    assert "is_valid" in result
-    assert result["is_valid"] is True
+    assert "front_results" in result
+    assert "mirror_results" in result
+    assert "direct_pose_2d" in result
+    assert "reflected_pose_2d" in result
     mock_detect_front.assert_called_once()
     mock_detect_mirror.assert_called_once()

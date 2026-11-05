@@ -26,6 +26,7 @@ class AuraLogger:
         self.expert_mode = True
 
     def toggle_mode(self) -> None:
+        """Toggles between expert (detailed) and user (simplified) logging modes."""
         self.expert_mode = not self.expert_mode
         self.log_event(f"Log mode toggled. Expert view: {self.expert_mode}")
 
@@ -74,14 +75,22 @@ class AuraLogger:
         y_offset = 65
 
         # 1. Render fixed/static events at the top (highlighted in soft orange)
-        for key, msg in self.static_events.values():
+        # CRITICAL FIX: Iterate directly over the values without strict unpacking.
+        # Supports both string values and legacy (msg, color) tuples.
+        for event_data in self.static_events.values():
+            if isinstance(event_data, tuple) and len(event_data) == 2:
+                msg, color = event_data
+            else:
+                msg = str(event_data)
+                color = (100, 200, 255)  # Default soft orange
+
             cv2.putText(
                 canvas,
                 msg,
                 (10, y_offset),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.5,
-                (100, 200, 255),
+                color,
                 1,
             )
             y_offset += 15
