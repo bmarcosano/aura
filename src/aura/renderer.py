@@ -48,13 +48,13 @@ class AuraRenderer:
         )
 
         commands = [
-            ("[G] Rec Golden Rep (Single)", (220, 220, 220)),
-            ("[U] Rec User Execution", (220, 220, 220)),
+            ("[G] Rec Golden (Metric only)", (220, 220, 220)),
+            ("[U] Rec User Execution (Metric only)", (220, 220, 220)),
             ("[S] Stop & Evaluate", (220, 220, 220)),
-            ("[W] Save Golden (JSON)", (220, 220, 220)),
-            ("[L] Load Golden (JSON)", (220, 220, 220)),
+            ("[W] Save Metric Golden (JSON)", (220, 220, 220)),
+            ("[L] Load Metric Golden (JSON)", (220, 220, 220)),
             ("[V] View Info & Status", (220, 220, 220)),
-            ("[D] Delete JSON File", (220, 220, 220)),
+            ("[D] Delete Metric Golden (JSON)", (220, 220, 220)),
             ("[Q] Quit AURA", (150, 150, 150)),
         ]
 

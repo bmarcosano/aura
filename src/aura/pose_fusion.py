@@ -20,7 +20,7 @@ class DualViewPoseFuser:
         aligner: MirrorToFrontAligner | None = None,
         minimum_joint_confidence: float = 0.05,
         max_mirror_share: float = 0.90,
-        conflict_ratio: float = 0.70,
+        conflict_ratio: float = 0.40,
         minimum_alignment_for_mirror_only: float = 0.35,
     ) -> None:
         self.aligner = aligner or MirrorToFrontAligner()
@@ -37,10 +37,18 @@ class DualViewPoseFuser:
         # The pelvis anchors the Front coordinate system. The mirror may refine
         # them slightly but cannot move the global root.
         self._mirror_share_caps = np.full(33, self.max_mirror_share, dtype=np.float32)
-        self._mirror_share_caps[[23, 24]] = 0.15
-        # Shoulder estimates may contribute to torso articulation but cannot
-        # redefine the whole-body coordinate frame.
-        self._mirror_share_caps[[11, 12]] = 0.65
+        # The pelvis is the permanent Front root. Keep a very small mirror
+        # contribution only to absorb numerical noise, never to move the root.
+        self._mirror_share_caps[[23, 24]] = 0.05
+        # Head/face and shoulder anchors stay Front-led. Mirror may refine them
+        # when useful, but must not drag the global frame around.
+        self._mirror_share_caps[0:11] = 0.35
+        self._mirror_share_caps[[11, 12]] = 0.35
+        self._front_reference_indices = {11, 12, 23, 24}
+        # Disagreement thresholds are joint-specific fractions of torso scale.
+        self._joint_conflict_limits = np.full(33, self.conflict_ratio, dtype=np.float32)
+        self._joint_conflict_limits[0:11] = min(self.conflict_ratio, 0.30)
+        self._joint_conflict_limits[[11, 12, 23, 24]] = min(self.conflict_ratio, 0.25)
 
     def reset(self) -> None:
         self.aligner.reset()
@@ -55,7 +63,7 @@ class DualViewPoseFuser:
         torso = np.linalg.norm(shoulder_center - hip_center)
         shoulder_width = np.linalg.norm(points[11] - points[12])
         values = [value for value in (torso, shoulder_width) if np.isfinite(value)]
-        return float(max(*values, 0.15))
+        return float(max(values + [0.15]))
 
     def _front_only_result(
         self, front: PoseObservation, alignment_quality: float, alignment_ready: bool
@@ -192,20 +200,19 @@ class DualViewPoseFuser:
                 continue
 
             if q_front < self.minimum_joint_confidence:
-                if index in (23, 24):
-                    # The pelvis defines the permanent Front coordinate anchor.
-                    # Never let a mirror-only hip observation replace it.
-                    if not np.isfinite(p_front).all():
-                        output[index] = (
-                            self._last_front[index]
-                            if self._last_front is not None
-                            else np.zeros(3, dtype=np.float32)
-                        )
-                    else:
+                if index in self._front_reference_indices:
+                    # Pelvis and shoulder anchors define the permanent Front
+                    # reference. A mirror-only observation must not replace
+                    # these global anchors when the Front detector is uncertain.
+                    if np.isfinite(p_front).all():
                         output[index] = p_front
+                    elif self._last_front is not None:
+                        output[index] = self._last_front[index]
+                    else:
+                        output[index] = np.zeros(3, dtype=np.float32)
                     confidence[index] = q_front
-                    valid[index] = bool(q_front > 0.0)
-                    sources.append("FRONT_ANCHOR_LOW_CONFIDENCE")
+                    valid[index] = False
+                    sources.append("FRONT_REFERENCE_LOW_CONFIDENCE")
                 elif alignment.quality >= self.minimum_alignment_for_mirror_only:
                     output[index] = p_mirror
                     confidence[index] = q_mirror * 0.75
@@ -239,11 +246,26 @@ class DualViewPoseFuser:
             # the confidence to expose an unresolved conflict.
             disagreement = float(np.linalg.norm(p_front - p_mirror))
             normalized_disagreement = disagreement / max(body_scale, 1e-6)
-            if normalized_disagreement > self.conflict_ratio:
-                if q_mirror > q_front * 1.5:
-                    output[index] = p_mirror
-                    confidence[index] = min(q_mirror, 0.55) * 0.65
-                    sources.append("MIRROR_CONFLICT_DOMINANT")
+            if normalized_disagreement > float(self._joint_conflict_limits[index]):
+                mirror_cap = float(self._mirror_share_caps[index])
+                if q_mirror > q_front * 1.5 and mirror_cap > 0.0:
+                    requested_share = q_mirror / max(q_front + q_mirror, 1e-6)
+                    mirror_share = min(requested_share, mirror_cap)
+                    output[index] = (
+                        1.0 - mirror_share
+                    ) * p_front + mirror_share * p_mirror
+                    confidence[index] = (
+                        min(
+                            (1.0 - mirror_share) * q_front + mirror_share * q_mirror,
+                            0.55,
+                        )
+                        * 0.75
+                    )
+                    sources.append(
+                        "MIRROR_DOMINANT"
+                        if mirror_share >= 0.65
+                        else "MIRROR_CONFLICT_DOMINANT"
+                    )
                 else:
                     output[index] = p_front
                     confidence[index] = min(q_front, 0.55) * 0.65

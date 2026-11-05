@@ -111,6 +111,7 @@ class Aura3DViewer:
         landmarks_3d: np.ndarray | None,
         plane_normal: np.ndarray | None = None,
         joint_colors: dict[int, str] | None = None,
+        joint_valid: np.ndarray | None = None,
     ) -> np.ndarray:
         """Renders floor grid, 3D Digital Twin skeleton, and directed SVD plane normal vector."""
         canvas = np.zeros((self.height, self.width, 3), dtype=np.uint8)
@@ -164,16 +165,31 @@ class Aura3DViewer:
 
         # 3. Render 3D Digital Twin Skeleton
         if landmarks_3d is not None and len(landmarks_3d) == 33:
-            pts_2d = [self._project_point(pt) for pt in landmarks_3d]
+            points = np.asarray(landmarks_3d, dtype=np.float32)
+            valid = np.isfinite(points).all(axis=1)
+            if joint_valid is not None:
+                valid &= np.asarray(joint_valid, dtype=bool).reshape(33)
+            pts_2d = [
+                self._project_point(points[index]) if valid[index] else None
+                for index in range(33)
+            ]
 
-            # Draw Bones
+            # Draw only bones whose two endpoints are currently valid.
             for idx_a, idx_b in self.CONNECTIONS:
-                pt_a = pts_2d[idx_a]
-                pt_b = pts_2d[idx_b]
-                cv2.line(canvas, pt_a, pt_b, (180, 180, 180), 2, cv2.LINE_AA)
+                if pts_2d[idx_a] is not None and pts_2d[idx_b] is not None:
+                    cv2.line(
+                        canvas,
+                        pts_2d[idx_a],
+                        pts_2d[idx_b],
+                        (180, 180, 180),
+                        2,
+                        cv2.LINE_AA,
+                    )
 
-            # Draw Joints with Dynamic Biomechanical Colors
+            # Draw only currently valid joints with dynamic biomechanical colors.
             for i, pt_2d in enumerate(pts_2d):
+                if pt_2d is None:
+                    continue
                 status = joint_colors.get(i, "default")
                 color = self.COLOR_MAP.get(status, self.COLOR_MAP["default"])
                 radius = 6 if i in (0, 11, 12, 23, 24) else 4
