@@ -23,7 +23,10 @@ class ArucoMultiTracker:
             dict_type: The ArUco dictionary to use (default: 4x4 squares, up to 50 IDs).
             marker_size_m: The physical size of the printed marker side in meters (default: 18 cm).
         """
-        self.marker_size = marker_size_m
+        self.marker_size = float(marker_size_m)
+        if not np.isfinite(self.marker_size) or self.marker_size <= 0.0:
+            raise ValueError("marker_size_m must be a positive finite value")
+        self.last_pose_errors: dict[int, float] = {}
 
         # Initialize ArUco dictionary and parameters (compatible with OpenCV 4.7+)
         self.aruco_dict = cv2.aruco.getPredefinedDictionary(dict_type)
@@ -56,6 +59,7 @@ class ArucoMultiTracker:
         corners, ids, _rejected = self.detector.detectMarkers(gray)
 
         poses = {}
+        self.last_pose_errors = {}
 
         if ids is not None:
             # Draw the square borders and IDs around detected markers
@@ -71,8 +75,24 @@ class ArucoMultiTracker:
                     flags=cv2.SOLVEPNP_IPPE_SQUARE,
                 )
 
-                if success:
-                    poses[marker_id] = (rvec, tvec)
+                if (
+                    success
+                    and np.isfinite(rvec).all()
+                    and np.isfinite(tvec).all()
+                    and float(tvec.reshape(3)[2]) > 0.0
+                ):
+                    projected, _ = cv2.projectPoints(
+                        self.obj_points, rvec, tvec, camera_matrix, dist_coeffs
+                    )
+                    projected = projected.reshape(-1, 2)
+                    observed = np.asarray(corners[i][0], dtype=np.float32).reshape(
+                        -1, 2
+                    )
+                    reprojection_rms = float(
+                        np.sqrt(np.mean(np.sum((projected - observed) ** 2, axis=1)))
+                    )
+                    self.last_pose_errors[int(marker_id)] = reprojection_rms
+                    poses[int(marker_id)] = (rvec, tvec)
                     # Draw the 3D coordinate axes (X=Red, Y=Green, Z=Blue) on the marker
                     cv2.drawFrameAxes(
                         frame, camera_matrix, dist_coeffs, rvec, tvec, self.marker_size
@@ -83,7 +103,7 @@ class ArucoMultiTracker:
                     text_pos = (int(corners[i][0][0][0]), int(corners[i][0][0][1]) - 10)
                     cv2.putText(
                         frame,
-                        f"Dist: {distance_cm:.1f}cm",
+                        f"Dist: {distance_cm:.1f}cm | Reproj: {reprojection_rms:.1f}px",
                         text_pos,
                         cv2.FONT_HERSHEY_SIMPLEX,
                         0.5,
@@ -92,6 +112,53 @@ class ArucoMultiTracker:
                     )
 
         return frame, poses
+
+    def estimate_floor_frame(
+        self, rvec: np.ndarray, tvec: np.ndarray
+    ) -> dict[str, np.ndarray]:
+        """Build a right-handed floor coordinate frame from a marker lying flat.
+
+        The returned basis columns are the floor-frame X, Y-down and Z axes
+        expressed in camera coordinates.  This matches the renderer convention:
+        points above the floor have negative Y.  The marker centre is the origin.
+        """
+        rotation, _ = cv2.Rodrigues(np.asarray(rvec, dtype=np.float64))
+        origin = np.asarray(tvec, dtype=np.float64).reshape(3)
+        if not np.isfinite(rotation).all() or not np.isfinite(origin).all():
+            raise ValueError("Floor marker pose contains non-finite values")
+
+        normal_toward_camera = rotation[:, 2].copy()
+        camera_direction_from_marker = -origin
+        if np.dot(normal_toward_camera, camera_direction_from_marker) < 0.0:
+            normal_toward_camera *= -1.0
+        normal_toward_camera /= max(np.linalg.norm(normal_toward_camera), 1e-12)
+
+        x_axis = rotation[:, 0].copy()
+        x_axis -= np.dot(x_axis, normal_toward_camera) * normal_toward_camera
+        x_norm = np.linalg.norm(x_axis)
+        if x_norm < 1e-8:
+            raise ValueError("Floor marker X axis is degenerate")
+        x_axis /= x_norm
+
+        # Renderer coordinates use positive Y down, so points above the floor
+        # have negative Y after transformation.
+        y_down = -normal_toward_camera
+        z_axis = np.cross(x_axis, y_down)
+        z_norm = np.linalg.norm(z_axis)
+        if z_norm < 1e-8:
+            raise ValueError("Could not construct floor-frame Z axis")
+        z_axis /= z_norm
+
+        basis_camera = np.column_stack((x_axis, y_down, z_axis))
+        if np.linalg.det(basis_camera) < 0.0:
+            z_axis *= -1.0
+            basis_camera = np.column_stack((x_axis, y_down, z_axis))
+
+        return {
+            "basis_camera": basis_camera.astype(np.float32),
+            "origin_camera": origin.astype(np.float32),
+            "normal_camera": normal_toward_camera.astype(np.float32),
+        }
 
     def estimate_mirror_plane(
         self, rvec: np.ndarray, tvec: np.ndarray

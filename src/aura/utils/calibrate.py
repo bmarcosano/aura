@@ -37,6 +37,8 @@ def calibrate_webcam(
 
     objpoints = []  # 3D points in real world space
     imgpoints = []  # 2D points in image plane
+    capture_centers: list[tuple[float, float]] = []
+    capture_sizes: list[tuple[float, float]] = []
 
     print("📸 --- WEBCAM CALIBRATION UTILITY ---")
     print(f"Target pattern: {board_size[0]}x{board_size[1]} inner corners.")
@@ -97,45 +99,105 @@ def calibrate_webcam(
                 gray, corners, (11, 11), (-1, -1), criteria
             )
 
-            objpoints.append(objp)
-            imgpoints.append(refined_corners)
+            objpoints.append(objp.copy())
+            imgpoints.append(refined_corners.copy())
+            corner_xy = refined_corners.reshape(-1, 2)
+            center = np.mean(corner_xy, axis=0)
+            extent = np.max(corner_xy, axis=0) - np.min(corner_xy, axis=0)
+            capture_centers.append((float(center[0]), float(center[1])))
+            capture_sizes.append((float(extent[0]), float(extent[1])))
             captured_count += 1
             print(f"✅ Frame {captured_count} captured successfully.")
 
     cap.release()
     cv2.destroyAllWindows()
 
-    if captured_count < 10:
+    if captured_count < 15:
         print(
-            f"⚠️ Warning: Only {captured_count} frames captured. Recommended is at least 15-20 for accurate calibration."
+            f"❌ Calibration not computed: only {captured_count} views captured. "
+            "Capture at least 15 varied checkerboard poses (preferably 20-25)."
         )
+        return
 
-    if captured_count > 0:
+    print(
+        "\n⚙️ Computing camera intrinsic matrix and distortion coefficients via cv2.calibrateCamera..."
+    )
+    gray_shape = gray.shape[::-1]  # (width, height)
+
+    # Warn when all captures concentrate in a small part of the image.  This is
+    # a coverage diagnostic, not a substitute for observing tilt/depth diversity.
+    centers = np.asarray(capture_centers, dtype=np.float32)
+    normalized_centers = centers / np.asarray(gray_shape, dtype=np.float32)
+    center_span = np.ptp(normalized_centers, axis=0)
+    size_span = np.ptp(
+        np.asarray(capture_sizes, dtype=np.float32), axis=0
+    ) / np.asarray(gray_shape, dtype=np.float32)
+    print(
+        f"Capture coverage: center span X={center_span[0]:.2f}, "
+        f"Y={center_span[1]:.2f}; board-size variation X={size_span[0]:.2f}, "
+        f"Y={size_span[1]:.2f}."
+    )
+    if float(np.min(center_span)) < 0.18:
         print(
-            "\n⚙️ Computing camera intrinsic matrix and distortion coefficients via cv2.calibrateCamera..."
+            "⚠️ Warning: checkerboard positions cover a narrow part of the image. "
+            "Repeat some captures near the edges/corners for better coverage."
         )
-        gray_shape = gray.shape[::-1]  # (width, height)
-
-        ret, camera_matrix, dist_coeffs, _rvecs, _tvecs = cv2.calibrateCamera(
-            objpoints, imgpoints, gray_shape, None, None
+    if float(np.max(size_span)) < 0.05:
+        print(
+            "⚠️ Warning: checkerboard apparent size changes very little. "
+            "Include closer/farther and tilted views, not only front-parallel views."
         )
 
-        if ret:
-            print("✅ Calibration successful!")
-            print(f"Camera Matrix K:\n{camera_matrix}")
-            print(f"Distortion Coefficients:\n{dist_coeffs.ravel()}")
+    rms, camera_matrix, dist_coeffs, rvecs, tvecs = cv2.calibrateCamera(
+        objpoints, imgpoints, gray_shape, None, None
+    )
 
-            # Save calibration parameters to disk
-            np.savez(
-                output_filename,
-                camera_matrix=camera_matrix,
-                dist_coeffs=dist_coeffs,
-                image_width=int(gray_shape[0]),
-                image_height=int(gray_shape[1]),
+    if (
+        np.isfinite(rms)
+        and np.isfinite(camera_matrix).all()
+        and np.isfinite(dist_coeffs).all()
+    ):
+        per_view_errors: list[float] = []
+        for object_points, image_points, rvec, tvec in zip(
+            objpoints, imgpoints, rvecs, tvecs
+        ):
+            projected, _ = cv2.projectPoints(
+                object_points, rvec, tvec, camera_matrix, dist_coeffs
             )
-            print(f"💾 Parameters successfully saved to '{output_filename}'.")
-        else:
-            print("❌ Camera calibration failed mathematically.")
+            difference = projected.reshape(-1, 2) - image_points.reshape(-1, 2)
+            per_view_errors.append(
+                float(np.sqrt(np.mean(np.sum(difference**2, axis=1))))
+            )
+
+        print("✅ Calibration computed.")
+        print(f"Global RMS: {float(rms):.4f} px")
+        print(
+            f"Per-view reprojection RMS: median={float(np.median(per_view_errors)):.4f} px, "
+            f"max={float(np.max(per_view_errors)):.4f} px"
+        )
+        if float(rms) > 1.5:
+            print(
+                "⚠️ Calibration RMS is relatively high (>1.5 px). "
+                "Inspect poor/outlier views and repeat calibration if necessary."
+            )
+        print(f"Camera Matrix K:\n{camera_matrix}")
+        print(f"Distortion Coefficients:\n{dist_coeffs.ravel()}")
+
+        np.savez(
+            output_filename,
+            camera_matrix=camera_matrix,
+            dist_coeffs=dist_coeffs,
+            image_width=int(gray_shape[0]),
+            image_height=int(gray_shape[1]),
+            rms=float(rms),
+            per_view_errors=np.asarray(per_view_errors, dtype=np.float32),
+            num_views=int(captured_count),
+            capture_centers=np.asarray(capture_centers, dtype=np.float32),
+            capture_sizes=np.asarray(capture_sizes, dtype=np.float32),
+        )
+        print(f"💾 Parameters and quality metadata saved to '{output_filename}'.")
+    else:
+        print("❌ Calibration failed: non-finite camera parameters or RMS.")
 
 
 if __name__ == "__main__":
