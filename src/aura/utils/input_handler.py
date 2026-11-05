@@ -1,36 +1,50 @@
 """
-input_handler.py: Maps keyboard inputs to core system commands.
+input_handler.py: Keypress controller and command mapper for AURA.
 """
+
+from __future__ import annotations
+
+from typing import ClassVar
 
 import cv2
 
 
 class KeyboardController:
-    """Parses OpenCV waitKey events and translates them into system actions."""
+    """Maps raw keyboard inputs to AURA FSM commands."""
 
-    @staticmethod
-    def get_command(delay: int) -> str:
+    COMMAND_MAP: ClassVar[dict[int, str]] = {
+        ord("g"): "REC_GOLDEN",
+        ord("G"): "REC_GOLDEN",
+        ord("u"): "REC_USER",
+        ord("U"): "REC_USER",
+        ord("s"): "STOP_REC",
+        ord("S"): "STOP_REC",
+        ord("w"): "SAVE_GOLDEN",
+        ord("W"): "SAVE_GOLDEN",
+        ord("l"): "LOAD_GOLDEN",
+        ord("L"): "LOAD_GOLDEN",
+        ord("v"): "VIEW_STATUS",
+        ord("V"): "VIEW_STATUS",
+        ord("d"): "DELETE_GOLDEN",
+        ord("D"): "DELETE_GOLDEN",
+        ord("q"): "QUIT",
+        ord("Q"): "QUIT",
+        ord("m"): "TOGGLE_LOG_MODE",
+        ord("M"): "TOGGLE_LOG_MODE",
+    }
+
+    @classmethod
+    def get_command(cls, delay: int = 33) -> tuple[str, int]:
         """
-        Waits for a key press for the given delay (ms).
-        Returns a string command mapping to the pressed key.
+        Polls OpenCV keypress. Returns (command_name, raw_key_code).
+        Uses waitKeyEx to properly capture extended keys (like Arrows).
         """
-        key = cv2.waitKey(delay) & 0xFF
+        raw_key = cv2.waitKeyEx(delay)
+        if raw_key == -1:
+            return "NONE", -1
 
-        if key == ord("q"):
-            return "QUIT"
-        elif key == ord("g"):
-            return "REC_GOLDEN"
-        elif key == ord("u"):
-            return "REC_USER"
-        elif key == ord("s"):
-            return "STOP_REC"
-        elif key == ord("w"):
-            return "SAVE_GOLDEN"
-        elif key == ord("l"):
-            return "LOAD_GOLDEN"
-        elif key == ord("v"):
-            return "VIEW_STATUS"
-        elif key == ord("d"):
-            return "DELETE_GOLDEN"
+        # Extract lower byte for standard ASCII matching if it's a standard key
+        char_key = raw_key & 0xFF
+        cmd = cls.COMMAND_MAP.get(char_key, "NONE")
 
-        return "NONE"
+        return cmd, raw_key

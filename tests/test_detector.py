@@ -94,3 +94,20 @@ def test_find_pose_legacy_helper(monkeypatch):
     # Assert
     assert isinstance(annotated_frame, np.ndarray)
     assert annotated_frame.shape == dummy_frame.shape
+
+
+def test_presence_falls_back_to_visibility_when_proto_presence_is_unset():
+    from types import SimpleNamespace
+
+    detector = PoseDetector()
+    landmarks = [SimpleNamespace(visibility=0.8, presence=0.0) for _ in range(33)]
+    detector.results = SimpleNamespace(
+        pose_landmarks=SimpleNamespace(landmark=landmarks)
+    )
+
+    presence = detector.get_presence_array()
+    visibility = detector.get_visibility_array()
+
+    assert presence.shape == (33,)
+    assert visibility.shape == (33,)
+    assert np.allclose(presence, visibility)

@@ -1,6 +1,8 @@
-from __future__ import annotations
+"""
+detector.py: MediaPipe Pose estimation and webcam stream management.
+"""
 
-"""detector.py: MediaPipe Pose estimation and webcam stream management."""
+from __future__ import annotations
 
 import cv2
 import mediapipe as mp
@@ -17,23 +19,33 @@ class PoseDetector:
         smooth_landmarks: bool = True,
         min_detection_confidence: float = 0.5,
         min_tracking_confidence: float = 0.5,
-    ):
-        # Direct initialization using modern MediaPipe solutions structure
+    ) -> None:
+        # Keep the configuration so the MediaPipe graph can be recreated after
+        # changing from full-frame tracking to a cropped ROI.
         self.mp_pose = mp.solutions.pose
         self.mp_draw = mp.solutions.drawing_utils
-
-        self.pose = self.mp_pose.Pose(
-            static_image_mode=static_image_mode,
-            model_complexity=model_complexity,
-            smooth_landmarks=smooth_landmarks,
-            min_detection_confidence=min_detection_confidence,
-            min_tracking_confidence=min_tracking_confidence,
-        )
-
+        self._pose_config = {
+            "static_image_mode": static_image_mode,
+            "model_complexity": model_complexity,
+            "smooth_landmarks": smooth_landmarks,
+            "min_detection_confidence": min_detection_confidence,
+            "min_tracking_confidence": min_tracking_confidence,
+        }
+        self.pose = self.mp_pose.Pose(**self._pose_config)
         self.results = None
+        self._closed = False
+        print("✅ PoseDetector initialized successfully.")
 
     def detect(self, frame: np.ndarray, draw: bool = True) -> np.ndarray | None:
-        """Processes an OpenCV frame, draws the skeleton overlay, and returns the landmark array."""
+        """
+        Processes via MediaPipe, draws the skeleton overlay,
+        and returns the pixel landmark array.
+        """
+        if self._closed or self.pose is None:
+            raise RuntimeError("PoseDetector is closed; call reset() before reuse.")
+        if frame is None or frame.ndim != 3 or frame.size == 0:
+            raise ValueError("frame must be a non-empty BGR image")
+
         h, w, _ = frame.shape
         image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         image_rgb.flags.writeable = False
@@ -67,15 +79,91 @@ class PoseDetector:
     def get_landmark_array(
         self, frame_width: int, frame_height: int
     ) -> np.ndarray | None:
-        """Extracts landmark coordinates (x, y, z, visibility) as a structured NumPy array."""
+        """Extracts landmark coordinates (x, y in pixels, z, visibility) as a NumPy array."""
         if not self.results or not self.results.pose_landmarks:
             return None
 
         landmarks = []
         for lm in self.results.pose_landmarks.landmark:
-            # Map normalized coordinates back to pixel space for x and y; keep z and visibility
+            # Map normalized coordinates back to pixel space for x and y
             landmarks.append(
                 [lm.x * frame_width, lm.y * frame_height, lm.z, lm.visibility]
             )
 
         return np.array(landmarks, dtype=np.float32)
+
+    def get_world_landmark_array(self) -> np.ndarray | None:
+        """Return MediaPipe's per-view 3D pose estimate, hip-centred and in metres.
+
+        These are model-estimated body-relative coordinates, not absolute camera
+        coordinates and not a calibrated stereo reconstruction.
+        """
+        if not self.results or not self.results.pose_world_landmarks:
+            return None
+
+        landmarks = []
+        for lm in self.results.pose_world_landmarks.landmark:
+            landmarks.append([lm.x, lm.y, lm.z])
+
+        return np.array(landmarks, dtype=np.float32)
+
+    def get_visibility_array(self) -> np.ndarray | None:
+        """Return MediaPipe visibility for all 33 landmarks (legacy-compatible)."""
+        if not self.results or not self.results.pose_landmarks:
+            return None
+        values = [
+            float(getattr(lm, "visibility", 0.0))
+            for lm in self.results.pose_landmarks.landmark
+        ]
+        return np.clip(np.asarray(values, dtype=np.float32), 0.0, 1.0)
+
+    def get_presence_array(self) -> np.ndarray | None:
+        """Return MediaPipe presence where available, otherwise visibility.
+
+        MediaPipe versions differ in whether ``presence`` is exposed by the
+        normalized pose landmark object. Falling back to visibility keeps the
+        confidence contract stable across supported versions.
+        """
+        if not self.results or not self.results.pose_landmarks:
+            return None
+        landmarks = self.results.pose_landmarks.landmark
+        values = []
+        for lm in landmarks:
+            visibility = float(getattr(lm, "visibility", 0.0))
+            presence = None
+            has_field = getattr(lm, "HasField", None)
+            if callable(has_field):
+                try:
+                    if has_field("presence"):
+                        presence = float(lm.presence)
+                except (ValueError, TypeError):
+                    presence = None
+            else:
+                raw_presence = getattr(lm, "presence", None)
+                if raw_presence is not None:
+                    presence = float(raw_presence)
+            # Proto3 scalar fields can read as 0 when unset. If that happens
+            # while visibility is positive, use visibility as the fallback.
+            if presence is None or (presence <= 0.0 < visibility):
+                presence = visibility
+            values.append(presence)
+        return np.clip(np.asarray(values, dtype=np.float32), 0.0, 1.0)
+
+    def close(self) -> None:
+        """Release the underlying MediaPipe graph. Safe to call more than once."""
+        if self._closed:
+            return
+        pose = self.pose
+        self.pose = None
+        self.results = None
+        self._closed = True
+        close_method = getattr(pose, "close", None)
+        if callable(close_method):
+            close_method()
+
+    def reset(self) -> None:
+        """Restart tracking state while preserving this detector's configuration."""
+        self.close()
+        self.pose = self.mp_pose.Pose(**self._pose_config)
+        self.results = None
+        self._closed = False

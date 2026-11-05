@@ -47,3 +47,4 @@ htmlcov/
 input_videos/
 
 golden_executions/
+camera_calibration*.npz
